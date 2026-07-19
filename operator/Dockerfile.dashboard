@@ -1,8 +1,24 @@
 # TrafficPolicy 대시보드 이미지. operator/ 디렉토리를 빌드 컨텍스트로 사용:
 #   docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
+#
+# HUBBLE_CLI_VERSION: /flows 페이지가 쓰는 hubble CLI 버전. **클러스터의 실제 Cilium
+# 버전과 맞춰야 한다** — 버전이 다르면 hubble-relay와의 gRPC 스키마 불일치("invalid
+# fieldmask")로 조회가 실패한다(실측 확인됨). 다른 클러스터에 배포한다면:
+#   docker build --build-arg HUBBLE_CLI_VERSION=v<클러스터의 cilium 버전> ...
 FROM python:3.12-slim
 
+ARG HUBBLE_CLI_VERSION=v1.18.6
+ARG TARGETARCH=amd64
+
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -sL "https://github.com/cilium/hubble/releases/download/${HUBBLE_CLI_VERSION}/hubble-linux-${TARGETARCH}.tar.gz" \
+       -o /tmp/hubble.tar.gz \
+    && tar -C /usr/local/bin -xzf /tmp/hubble.tar.gz hubble \
+    && chmod +x /usr/local/bin/hubble \
+    && rm /tmp/hubble.tar.gz \
+    && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir fastapi uvicorn kubernetes

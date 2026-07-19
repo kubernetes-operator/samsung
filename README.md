@@ -80,15 +80,21 @@ spec:
 
 ## 대시보드
 
-TrafficPolicy CR들의 현재 상태(phase, 마지막 판단/실행 결과)를 보여주는 읽기 전용 웹
-UI가 `operator/k8s_traffic_operator/dashboard/`에 있다. 오퍼레이터 본체와 별도 프로세스로
-동작하며 클러스터에 아무것도 쓰지 않는다(get/list/watch만).
+읽기 전용 웹 UI가 `operator/k8s_traffic_operator/dashboard/`에 있다. 오퍼레이터 본체와
+별도 프로세스로 동작하며 클러스터에 아무것도 쓰지 않는다(조회만).
+
+- **`/` — TrafficPolicy 현황**: 각 CR의 phase, 마지막 판단(action/reason/severity), 실제
+  적용 여부. Gateway API 트래픽 메트릭 기반 오퍼레이터 판단 결과다.
+- **`/flows` — 실시간 Pod 트래픽 흐름**: Cilium Hubble에서 가져온 실제 Pod 간 L3/L4
+  연결(어느 Pod가 어느 Pod와 통신했는지, allow/deny, 프로토콜, 연결 수). Gateway API
+  메트릭이 없는 클러스터에서도 CNI 레벨에서 실제 트래픽을 볼 수 있다 — 단, HTTP
+  요청수/에러율이 아니라 연결 단위 데이터이므로 위 TrafficPolicy 판단과는 성격이 다르다.
 
 ```bash
-# 로컬에서 (현재 kubeconfig 컨텍스트 대상)
+# 로컬에서 (현재 kubeconfig 컨텍스트 + hubble CLI 필요 시)
 cd operator
 ./.venv/bin/uvicorn k8s_traffic_operator.dashboard.app:app --reload
-# http://localhost:8000 접속 (HTML), http://localhost:8000/api/policies (JSON)
+# http://localhost:8000 (정책 현황), http://localhost:8000/flows (트래픽 흐름)
 
 # 클러스터에 배포 (이미지 빌드/푸시 후 <registry> 값 교체 필요)
 docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
@@ -96,6 +102,10 @@ kubectl apply -f deploy/dashboard.yaml
 ```
 
 특정 네임스페이스만 보고 싶으면 `WATCH_NAMESPACE` 환경변수를 지정한다(비우면 클러스터 전체).
+`/flows`는 `HUBBLE_RELAY_ADDR`(기본 `hubble-relay.kube-system.svc.cluster.local:80`)로
+hubble-relay에 접속한다 — **이미지에 포함된 hubble CLI 버전이 클러스터의 Cilium 버전과
+맞아야 한다**(Dockerfile.dashboard의 `HUBBLE_CLI_VERSION` 빌드 인자 참조), 버전이 다르면
+"invalid fieldmask" 오류로 조회가 실패한다.
 
 **배포 시 주의**: HTTPRoute로 외부에 연결하면 인증이 없는 상태다. 읽기 전용이라 해도
 운영 환경에서는 앞단에 접근 제어(OAuth 프록시, IP 제한 등)를 추가하는 것을 권장한다.

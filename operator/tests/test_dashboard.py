@@ -190,3 +190,72 @@ def test_error_row_rendered_for_fetch_failure(monkeypatch):
     client = TestClient(dashboard_app.app)
     resp = client.get("/")
     assert "권한 없음" in resp.text
+
+
+# --------------------------------------------------------------------------- /flows, /api/flows (Hubble)
+from k8s_traffic_operator.dashboard.hubble_flows import FlowSummary
+
+
+def test_flows_html_renders_verdicts_and_pairs(monkeypatch):
+    summary = FlowSummary(
+        total=3,
+        verdicts={"FORWARDED": 2, "DROPPED": 1},
+        top_pairs=[{"src": "shop/checkout-abc", "dst": "shop/cart-def", "protocol": "TCP",
+                    "dst_port": 8080, "count": 2, "last_seen": "2026-07-19T12:00:00.000000000Z"}],
+    )
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: summary)
+    client = TestClient(dashboard_app.app)
+    resp = client.get("/flows")
+    assert resp.status_code == 200
+    assert "shop/checkout-abc" in resp.text
+    assert "shop/cart-def" in resp.text
+    assert "FORWARDED" in resp.text
+    assert "DROPPED" in resp.text
+
+
+def test_flows_html_shows_fetch_error_explicitly(monkeypatch):
+    summary = FlowSummary(fetch_error="hubble CLI를 찾을 수 없음")
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: summary)
+    client = TestClient(dashboard_app.app)
+    resp = client.get("/flows")
+    assert "hubble CLI를 찾을 수 없음" in resp.text
+
+
+def test_flows_html_shows_empty_state_when_zero_flows(monkeypatch):
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: FlowSummary(total=0))
+    client = TestClient(dashboard_app.app)
+    resp = client.get("/flows")
+    assert "관측된 흐름이 없습니다" in resp.text
+
+
+def test_api_flows_returns_json(monkeypatch):
+    summary = FlowSummary(total=5, verdicts={"FORWARDED": 5}, top_pairs=[{
+        "src": "a", "dst": "b", "protocol": "TCP", "dst_port": 80, "count": 5, "last_seen": "t",
+    }])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: summary)
+    client = TestClient(dashboard_app.app)
+    resp = client.get("/api/flows")
+    payload = resp.json()
+    assert payload["total"] == 5
+    assert payload["topPairs"][0]["dst"] == "b"
+    assert payload["fetchError"] is None
+
+
+def test_flows_html_escapes_pod_names_for_xss(monkeypatch):
+    summary = FlowSummary(total=1, verdicts={"FORWARDED": 1}, top_pairs=[{
+        "src": "<script>alert(1)</script>", "dst": "b", "protocol": "TCP",
+        "dst_port": 80, "count": 1, "last_seen": "2026-07-19T12:00:00.000000000Z",
+    }])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: summary)
+    client = TestClient(dashboard_app.app)
+    resp = client.get("/flows")
+    assert "<script>alert(1)</script>" not in resp.text
+    assert "&lt;script&gt;" in resp.text
+
+
+def test_nav_links_present_on_both_pages(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda: FlowSummary(total=0))
+    client = TestClient(dashboard_app.app)
+    assert 'href="/flows"' in client.get("/").text
+    assert 'href="/"' in client.get("/flows").text

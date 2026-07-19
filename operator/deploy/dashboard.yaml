@@ -70,6 +70,8 @@ spec:
           env:
             - name: WATCH_NAMESPACE
               value: ""  # 비우면 클러스터 전체. 특정 네임스페이스만 보려면 채우고 위 RBAC도 좁힐 것.
+            - name: HUBBLE_RELAY_ADDR
+              value: "hubble-relay.kube-system.svc.cluster.local:80"  # /flows 페이지가 조회할 hubble-relay 주소.
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
