@@ -97,6 +97,9 @@ kubectl apply -f deploy/dashboard.yaml
 
 특정 네임스페이스만 보고 싶으면 `WATCH_NAMESPACE` 환경변수를 지정한다(비우면 클러스터 전체).
 
+**배포 시 주의**: HTTPRoute로 외부에 연결하면 인증이 없는 상태다. 읽기 전용이라 해도
+운영 환경에서는 앞단에 접근 제어(OAuth 프록시, IP 제한 등)를 추가하는 것을 권장한다.
+
 ## 지원 Gateway API 구현체
 
 Envoy Gateway, Istio, nginx Gateway Fabric. 새 구현체는
