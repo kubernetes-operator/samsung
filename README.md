@@ -28,8 +28,11 @@ operator/
 │   ├── handlers.py                 # kopf 핸들러(reconcile 배선)
 │   ├── metrics/                    # 트래픽 메트릭 수집 (Envoy Gateway / Istio / nginx Gateway Fabric)
 │   ├── policy/                     # 스케일링·이상탐지·복구 정책 엔진
-│   └── actuator/                   # Deployment 스케일 + HTTPRoute weight 실행기
-└── tests/                          # pytest 회귀 테스트 (116개)
+│   ├── actuator/                   # Deployment 스케일 + HTTPRoute weight 실행기
+│   └── dashboard/                  # 읽기 전용 웹 대시보드 (별도 프로세스)
+├── deploy/dashboard.yaml           # 대시보드 배포 매니페스트 (ServiceAccount/RBAC/Deployment/Service)
+├── Dockerfile.dashboard
+└── tests/                          # pytest 회귀 테스트 (128개)
 ```
 
 ## 시작하기
@@ -74,6 +77,25 @@ spec:
     allowRouteIsolation: true
   window: "1m"
 ```
+
+## 대시보드
+
+TrafficPolicy CR들의 현재 상태(phase, 마지막 판단/실행 결과)를 보여주는 읽기 전용 웹
+UI가 `operator/k8s_traffic_operator/dashboard/`에 있다. 오퍼레이터 본체와 별도 프로세스로
+동작하며 클러스터에 아무것도 쓰지 않는다(get/list/watch만).
+
+```bash
+# 로컬에서 (현재 kubeconfig 컨텍스트 대상)
+cd operator
+./.venv/bin/uvicorn k8s_traffic_operator.dashboard.app:app --reload
+# http://localhost:8000 접속 (HTML), http://localhost:8000/api/policies (JSON)
+
+# 클러스터에 배포 (이미지 빌드/푸시 후 <registry> 값 교체 필요)
+docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
+kubectl apply -f deploy/dashboard.yaml
+```
+
+특정 네임스페이스만 보고 싶으면 `WATCH_NAMESPACE` 환경변수를 지정한다(비우면 클러스터 전체).
 
 ## 지원 Gateway API 구현체
 

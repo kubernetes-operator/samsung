@@ -1,0 +1,89 @@
+# TrafficPolicy 대시보드 배포 매니페스트.
+#
+# 읽기 전용 웹 UI다 — ClusterRole은 trafficpolicies에 대한 get/list/watch만 부여하고
+# 쓰기 verb(create/update/patch/delete)는 없다. 오퍼레이터 본체(actuator/policy)와
+# 완전히 분리된 별도 Deployment로 배포하므로, 대시보드가 죽어도 오퍼레이터 동작에
+# 영향이 없고, 반대로 오퍼레이터가 죽어도 대시보드는 마지막으로 관측한 CR 상태를 계속 보여준다.
+#
+# 특정 네임스페이스만 보고 싶으면 Deployment의 WATCH_NAMESPACE 값을 채우고,
+# 아래 ClusterRole/ClusterRoleBinding을 그 네임스페이스의 Role/RoleBinding으로 좁혀도 된다.
+#
+# 이미지 빌드: docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
+# 이 저장소에는 접근 가능한 레지스트리가 연결돼 있지 않으므로, 실제 배포 전 <registry> 값을
+# 사용 환경에 맞게 치환하고 이미지를 빌드/푸시해야 한다.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traffic-policy-dashboard
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traffic-policy-dashboard-viewer
+rules:
+  - apiGroups: ["ops.example.com"]
+    resources: ["trafficpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traffic-policy-dashboard-viewer
+subjects:
+  - kind: ServiceAccount
+    name: traffic-policy-dashboard
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: traffic-policy-dashboard-viewer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-policy-dashboard
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-policy-dashboard
+  template:
+    metadata:
+      labels:
+        app: traffic-policy-dashboard
+    spec:
+      serviceAccountName: traffic-policy-dashboard
+      containers:
+        - name: dashboard
+          image: <registry>/traffic-policy-dashboard:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""  # 비우면 클러스터 전체. 특정 네임스페이스만 보려면 채우고 위 RBAC도 좁힐 것.
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          resources:
+            requests: { cpu: "10m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-policy-dashboard
+  namespace: default
+spec:
+  selector:
+    app: traffic-policy-dashboard
+  ports:
+    - port: 80
+      targetPort: 8080
+# 외부 노출은 필요에 따라 Ingress/HTTPRoute를 별도로 붙인다(이 매니페스트는 클러스터
+# 내부 ClusterIP까지만 제공 — 읽기 전용이어도 인증 없이 외부에 열지 않도록 주의).
