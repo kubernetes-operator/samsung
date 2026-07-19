@@ -1,0 +1,7 @@
+# k8s-traffic-operator 런타임 의존성
+kopf>=1.37,<2.0            # Kubernetes Operator 프레임워크 (핸들러/타이머)
+kubernetes>=29.0.0        # actuator: Deployment/HTTPRoute 리소스 패치
+requests>=2.31.0          # metrics: Prometheus HTTP API 조회
+
+# 개발/테스트
+pytest>=8.0.0

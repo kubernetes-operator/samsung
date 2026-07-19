@@ -1,0 +1,135 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trafficpolicies.ops.example.com
+spec:
+  group: ops.example.com
+  scope: Namespaced
+  names:
+    kind: TrafficPolicy
+    listKind: TrafficPolicyList
+    plural: trafficpolicies
+    singular: trafficpolicy
+    shortNames:
+      - tp
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["target", "thresholds", "actions", "window"]
+              properties:
+
+                # ---------------------------------------------------------
+                # 1) target - 무엇을 관리할지
+                # ---------------------------------------------------------
+                target:
+                  type: object
+                  required: ["httpRoute", "deployment"]
+                  properties:
+                    httpRoute:
+                      type: string
+                      description: "관측 대상 Gateway API HTTPRoute 이름."
+                    namespace:
+                      type: string
+                      description: "대상 리소스 네임스페이스. 생략 시 CR과 동일 네임스페이스."
+                    deployment:
+                      type: string
+                      description: "스케일 대상 Deployment 이름(backend). replica 조정 대상."
+
+                # ---------------------------------------------------------
+                # 2) thresholds - 트래픽 임계값 (트래픽 지표가 1급 시민)
+                #    스케일업/다운 임계값을 분리(hysteresis)하여 flapping을 CRD 레벨에서 방지.
+                # ---------------------------------------------------------
+                thresholds:
+                  type: object
+                  required: ["targetRPSPerPod"]
+                  properties:
+                    targetRPSPerPod:
+                      type: number
+                      minimum: 0
+                      description: "파드당 목표 RPS(req/s). 실측 RPS/pod가 이를 초과하면 스케일업 신호."
+                    scaleDownRPSPerPod:
+                      type: number
+                      minimum: 0
+                      description: >-
+                        스케일다운 임계값(req/s). 실측 RPS/pod가 이보다 낮을 때만 축소.
+                        targetRPSPerPod보다 낮게 설정하여 hysteresis 밴드를 만든다(flapping 방지).
+                    scaleUpErrorRate:
+                      type: number
+                      minimum: 0
+                      maximum: 1
+                      description: "에러율 상한(0.0~1.0 비율). 초과 시 이상 신호/대응 트리거. 퍼센트 아님."
+                    maxP99LatencyMs:
+                      type: number
+                      minimum: 0
+                      description: "p99 지연시간 상한(ms). 초과 시 스케일업/대응 신호."
+
+                # ---------------------------------------------------------
+                # 3) actions - 어떻게 대응할지 (cooldown/hysteresis 안전장치 필수)
+                # ---------------------------------------------------------
+                actions:
+                  type: object
+                  required: ["minReplicas", "maxReplicas", "cooldownSeconds"]
+                  properties:
+                    minReplicas:
+                      type: integer
+                      minimum: 0
+                      description: "스케일다운 하한. actuator가 이 값 미만으로 줄이지 않는다."
+                    maxReplicas:
+                      type: integer
+                      minimum: 1
+                      description: "스케일업 상한. actuator가 이 값 초과로 늘리지 않는다."
+                    cooldownSeconds:
+                      type: integer
+                      minimum: 0
+                      description: >-
+                        한 번 대응한 뒤 다음 대응까지의 최소 대기 시간(초).
+                        policy 엔진이 이 값을 소비해 flapping을 방지한다(필수 안전장치).
+                    maxScaleStep:
+                      type: integer
+                      minimum: 1
+                      description: "1회 reconcile당 허용하는 최대 replica 변경 폭. 급격한 스케일 방지(actuator 소비). 선택."
+                    allowRouteIsolation:
+                      type: boolean
+                      default: false
+                      description: >-
+                        에러율 급증 시 문제 backend의 HTTPRoute weight를 낮춰 격리(isolate_backend)
+                        하는 것을 허용할지. false면 actuator가 격리 액션을 거부한다.
+
+                # ---------------------------------------------------------
+                # 4) window - 관측 윈도우
+                # ---------------------------------------------------------
+                window:
+                  type: string
+                  pattern: '^[0-9]+(ms|s|m|h)$'
+                  default: "1m"
+                  description: >-
+                    메트릭 집계 시간 윈도우. 예: "30s", "1m", "5m".
+                    reconcile timer interval(기본 30s)보다 크거나 같게 두어 안정적으로 집계한다.
+
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              description: "오퍼레이터가 기록하는 관측 상태(phase, lastDecision, lastActuation 등)."
+      additionalPrinterColumns:
+        - name: HTTPRoute
+          type: string
+          jsonPath: .spec.target.httpRoute
+        - name: Deployment
+          type: string
+          jsonPath: .spec.target.deployment
+        - name: Phase
+          type: string
+          jsonPath: .status.reconcile.phase
+        - name: LastAction
+          type: string
+          jsonPath: .status.reconcile.lastDecision.action
+      subresources:
+        status: {}
