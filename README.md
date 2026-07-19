@@ -1,2 +1,87 @@
-# samsung
-change path
+# samsung — Kubernetes 트래픽 기반 자동운영 오퍼레이터
+
+Pod의 CPU/메모리가 아니라 **서비스 트래픽(RPS, 에러율, 지연시간)**을 기준으로
+Kubernetes를 자동 운영하는 Python [kopf](https://kopf.readthedocs.io/) 오퍼레이터.
+Gateway API(HTTPRoute)를 통해 관측되는 실제 트래픽 지표로 스케일링, 장애 감지,
+라우팅 제어, 이상 탐지·자동 복구를 수행한다.
+
+## 왜 트래픽 기반인가
+
+리소스 사용률(CPU/메모리)은 원인일 뿐 결과가 아니다 — 사용자가 실제로 겪는 것은
+요청 실패율과 응답 속도다. 이 오퍼레이터는 RPS/에러율/지연시간을 1급 시민으로 삼아
+판단하며, CRD 어디에도 CPU/메모리 임계값이 존재하지 않는다.
+
+## 핵심 기능
+
+- **트래픽 기반 스케일링**: 파드당 RPS가 목표치를 초과/미달하면 replica 조정 (스케일업/다운 임계값 분리로 flapping 방지)
+- **이상 탐지**: 정적 임계값(CRD 명시값) + EWMA baseline 이탈 조합
+- **라우팅 격리·복구**: 에러가 특정 backend에 집중되면 HTTPRoute weight를 낮춰 격리하고, 해소되면 점진적으로 복구
+- **안전장치**: cooldown, hysteresis, 변경 폭 제한, idempotent patch, dry-run
+
+## 구조
+
+```
+operator/
+├── crds/trafficpolicy.yaml         # TrafficPolicy CRD
+├── k8s_traffic_operator/
+│   ├── schemas.py                  # 모듈 간 공유 계약(TrafficSnapshot/Decision/ActuationResult)
+│   ├── handlers.py                 # kopf 핸들러(reconcile 배선)
+│   ├── metrics/                    # 트래픽 메트릭 수집 (Envoy Gateway / Istio / nginx Gateway Fabric)
+│   ├── policy/                     # 스케일링·이상탐지·복구 정책 엔진
+│   └── actuator/                   # Deployment 스케일 + HTTPRoute weight 실행기
+└── tests/                          # pytest 회귀 테스트 (116개)
+```
+
+## 시작하기
+
+```bash
+cd operator
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+
+# 테스트 실행
+./.venv/bin/pytest
+
+# CRD 설치 (클러스터 대상)
+kubectl apply -f crds/trafficpolicy.yaml
+
+# 오퍼레이터 실행 (operator/ 디렉토리에서, 모듈 모드)
+./.venv/bin/kopf run -m k8s_traffic_operator.main --verbose
+```
+
+### TrafficPolicy 예시
+
+```yaml
+apiVersion: ops.example.com/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: checkout-traffic-policy
+spec:
+  target:
+    httpRoute: checkout-route
+    namespace: shop
+    deployment: checkout-service
+  thresholds:
+    targetRPSPerPod: 50
+    scaleDownRPSPerPod: 20
+    scaleUpErrorRate: 0.05
+    maxP99LatencyMs: 800
+  actions:
+    minReplicas: 2
+    maxReplicas: 20
+    cooldownSeconds: 120
+    maxScaleStep: 4
+    allowRouteIsolation: true
+  window: "1m"
+```
+
+## 지원 Gateway API 구현체
+
+Envoy Gateway, Istio, nginx Gateway Fabric. 새 구현체는
+`operator/k8s_traffic_operator/metrics/adapters/`에 어댑터를 추가하면 된다
+(`base.GatewayAdapter` 참조).
+
+## 개발 하네스
+
+이 프로젝트는 5개 전문 에이전트(설계/메트릭/정책/실행/QA)와 오케스트레이터 스킬로
+구성된 하네스로 만들어졌다. 하네스 구성과 변경 이력은 [CLAUDE.md](CLAUDE.md) 참조.
