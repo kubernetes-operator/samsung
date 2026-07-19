@@ -1,1 +1,2 @@
 # samsung
+change path
