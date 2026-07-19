@@ -1,0 +1,97 @@
+# k8s-traffic-operator 본체를 클러스터에 상시 배포하는 매니페스트.
+#
+# GATEWAY_IMPLEMENTATION=cilium-hubble로 실행한다 — 이 클러스터의 Gateway API 구현체
+# (nginx Gateway Fabric)가 트래픽 메트릭을 노출하지 않아서, Cilium/Hubble 기반 CNI
+# 트래픽 관측 경로를 쓴다(metrics/hubble_collector.py, 2026-07-19 실측 검증됨).
+#
+# 클러스터 전역(-A/--all-namespaces)으로 모든 네임스페이스의 TrafficPolicy CR을 관찰한다 —
+# 어떤 네임스페이스에 CR이 생길지 미리 알 수 없으므로 ClusterRole이 필요하다. 다만 쓰기
+# 권한(Deployment scale, HTTPRoute weight)은 각 CR의 target에 실제로 명시된 리소스에만
+# 적용된다(actuator는 CR의 spec.target 밖의 리소스는 절대 건드리지 않는다).
+#
+# 이미지 빌드/푸시:
+#   docker build -t registry.local.cloud:5000/k8s-traffic-operator:latest .
+#   docker push registry.local.cloud:5000/k8s-traffic-operator:latest
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traffic-ops-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traffic-operator
+  namespace: traffic-ops-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traffic-operator
+rules:
+  - apiGroups: ["ops.example.com"]
+    resources: ["trafficpolicies"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["ops.example.com"]
+    resources: ["trafficpolicies/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # kopf 내부 discovery(--namespace 패턴 매칭)에 필요한 읽기 전용 클러스터 범위 권한.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traffic-operator
+subjects:
+  - kind: ServiceAccount
+    name: traffic-operator
+    namespace: traffic-ops-system
+roleRef:
+  kind: ClusterRole
+  name: traffic-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-operator
+  namespace: traffic-ops-system
+spec:
+  replicas: 1  # kopf peering(HA/leader election) 미구성 — 단일 replica로 운용.
+  selector:
+    matchLabels:
+      app: traffic-operator
+  template:
+    metadata:
+      labels:
+        app: traffic-operator
+    spec:
+      serviceAccountName: traffic-operator
+      containers:
+        - name: operator
+          image: registry.local.cloud:5000/k8s-traffic-operator:latest
+          env:
+            - name: GATEWAY_IMPLEMENTATION
+              value: "cilium-hubble"
+            - name: HUBBLE_RELAY_ADDR
+              value: "hubble-relay.kube-system.svc.cluster.local:80"
+          resources:
+            requests: { cpu: "20m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "256Mi" }

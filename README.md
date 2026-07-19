@@ -30,9 +30,11 @@ operator/
 │   ├── policy/                     # 스케일링·이상탐지·복구 정책 엔진
 │   ├── actuator/                   # Deployment 스케일 + HTTPRoute weight 실행기
 │   └── dashboard/                  # 읽기 전용 웹 대시보드 (별도 프로세스)
+├── Dockerfile                      # 오퍼레이터 본체 이미지
+├── deploy/operator.yaml            # 오퍼레이터 배포 매니페스트 (ClusterRole/Deployment, 클러스터 전역 감시)
 ├── deploy/dashboard.yaml           # 대시보드 배포 매니페스트 (ServiceAccount/RBAC/Deployment/Service)
 ├── Dockerfile.dashboard
-└── tests/                          # pytest 회귀 테스트 (128개)
+└── tests/                          # pytest 회귀 테스트 (168개)
 ```
 
 ## 시작하기
@@ -48,9 +50,20 @@ python3 -m venv .venv
 # CRD 설치 (클러스터 대상)
 kubectl apply -f crds/trafficpolicy.yaml
 
-# 오퍼레이터 실행 (operator/ 디렉토리에서, 모듈 모드)
+# 로컬 실행 (operator/ 디렉토리에서, 모듈 모드)
 ./.venv/bin/kopf run -m k8s_traffic_operator.main --verbose
+
+# 클러스터에 상시 배포 (이미지 빌드/푸시 후 deploy/operator.yaml의 <registry> 값 교체)
+docker build -t <registry>/k8s-traffic-operator:latest .
+docker push <registry>/k8s-traffic-operator:latest
+kubectl apply -f deploy/operator.yaml
 ```
+
+`deploy/operator.yaml`은 `-A`(전체 네임스페이스) 모드로 배포한다 — 어떤 네임스페이스에
+TrafficPolicy CR이 생길지 미리 알 수 없으므로 ClusterRole이 필요하다. 쓰기 권한(Deployment
+scale, HTTPRoute weight)은 각 CR의 `spec.target`에 실제로 명시된 리소스에만 적용된다.
+이 클러스터에는 `GATEWAY_IMPLEMENTATION=cilium-hubble`로 배포되어 있다(아래 "대안 트래픽
+소스" 참조) — 실제로 `traffic-ops-test/echo-backend-policy`를 지속적으로 reconcile 중이다.
 
 ### TrafficPolicy 예시
 
