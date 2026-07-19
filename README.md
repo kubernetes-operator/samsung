@@ -116,6 +116,33 @@ Envoy Gateway, Istio, nginx Gateway Fabric. 새 구현체는
 `operator/k8s_traffic_operator/metrics/adapters/`에 어댑터를 추가하면 된다
 (`base.GatewayAdapter` 참조).
 
+## 대안 트래픽 소스: Cilium Hubble (CNI 기반)
+
+Gateway API 구현체가 트래픽 메트릭을 노출하지 않는 클러스터에서도, Cilium/Hubble이
+떠 있으면(`enable-hubble: "true"`) 정책 엔진이 CNI 레벨에서 실제 Pod 트래픽을 보고
+스케일링을 판단할 수 있다. `GATEWAY_IMPLEMENTATION=cilium-hubble` 환경변수로 켠다
+(CRD의 `spec.metrics`는 openAPIV3Schema에 없어 CR에서는 설정할 수 없다 — 오퍼레이터
+프로세스의 환경변수로만 전환한다).
+
+```bash
+GATEWAY_IMPLEMENTATION=cilium-hubble \
+HUBBLE_RELAY_ADDR=hubble-relay.kube-system.svc.cluster.local:80 \
+kopf run -m k8s_traffic_operator.main
+```
+
+**이 경로로 채워지는 값의 의미가 Gateway API 경로와 다르다** (자세한 내용은
+`metrics/hubble_collector.py` 모듈 docstring 참조):
+- `rps`: 대상 Deployment로 향한 **L3/L4 연결(flow) 수 / 윈도우 초** — HTTP 요청 수 아님.
+- `error_rate`: verdict가 FORWARDED가 아닌(네트워크 정책 거부 등) 연결의 비율 — HTTP
+  5xx 비율이 아니다. 제한적인 CiliumNetworkPolicy가 없는 클러스터에서는 사실상 항상 0.
+- 지연시간(p50/p95/p99)과 per_backend(격리 판단용)는 이 경로에서 제공되지 않는다
+  (항상 None/빈 값) — 즉 이 경로는 **스케일링·전체 이상탐지만** 지원하고
+  isolate_backend/reroute는 트리거되지 않는다.
+
+대상은 CRD의 `target.namespace` + `target.deployment`로 특정한다(HTTPRoute는 쓰지 않음).
+`hubble` CLI가 오퍼레이터 실행 환경에 있어야 하며, 버전은 클러스터의 Cilium 버전과
+맞춰야 한다(대시보드의 `HUBBLE_CLI_VERSION`과 동일한 제약).
+
 ## 개발 하네스
 
 이 프로젝트는 5개 전문 에이전트(설계/메트릭/정책/실행/QA)와 오케스트레이터 스킬로

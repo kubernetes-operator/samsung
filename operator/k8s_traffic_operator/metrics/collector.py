@@ -27,6 +27,14 @@ status 판정:
       kube_deployment_status_replicas_ready 로 조회. 불가/부재 시 None(로깅), status 는 유지.
     spec 은 dict 이며 아직 스키마에 없는 metrics 하위 블록은 .get() 으로 안전 접근한다
     (architect 가 후속에 추가할 수 있으므로 forward-compatible).
+
+Hubble(CNI) 대안 경로:
+    spec.metrics.implementation(또는 GATEWAY_IMPLEMENTATION 환경변수)이 "cilium-hubble"/
+    "hubble"/"cilium"이면 Prometheus/어댑터 경로를 완전히 건너뛰고 hubble_collector.py로
+    위임한다. Gateway API가 트래픽 메트릭을 노출하지 않는 클러스터에서도 Cilium/Hubble이
+    떠 있으면 실제 트래픽을 볼 수 있다는 것이 이 경로의 존재 이유다 — 단, rps/error_rate의
+    의미가 다르고(연결 단위, HTTP 아님) latency/per_backend는 제공되지 않는다.
+    자세한 내용은 hubble_collector.py의 모듈 docstring 참조.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from ..schemas import BackendTraffic, TrafficSnapshot
+from . import hubble_collector
 from .adapters import DEFAULT_IMPL, get_adapter
 from .prometheus_client import (
     PrometheusClient,
@@ -49,6 +58,11 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_PROM_URL = "http://prometheus-server.monitoring.svc:80"
 _DEFAULT_WINDOW = "1m"
+
+# "cilium-hubble" 등으로 지정되면 Gateway API/Prometheus 경로를 완전히 건너뛰고
+# hubble_collector로 위임한다. Hubble은 GatewayAdapter가 아니다(PromQL을 쓰지 않으므로
+# adapters/ 레지스트리에 넣지 않는다) — 별도의 수집 경로로 취급한다.
+_HUBBLE_IMPL_NAMES = frozenset({"cilium-hubble", "hubble", "cilium"})
 
 # CRD window 패턴: ^[0-9]+(ms|s|m|h)$  (PromQL range 문자열과 동일 표기)
 _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
@@ -63,6 +77,13 @@ def collect(spec: dict) -> TrafficSnapshot:
     now = time.time()
 
     try:
+        impl = _resolve_impl(spec)
+        if (impl or "").strip().lower() in _HUBBLE_IMPL_NAMES:
+            # Hubble 경로는 HTTPRoute를 쓰지 않는다(Gateway API를 모름) - target.deployment만으로
+            # 특정한다. 이 try 블록 안에 두어야 hubble_collector 내부에서 예기치 못한 예외가
+            # 나도(collect() 자체의 "예외를 밖으로 던지지 않는다" 계약이 깨지지 않는다.
+            return hubble_collector.collect(spec, window_seconds, now)
+
         target = (spec or {}).get("target", {}) or {}
         route = target.get("httpRoute")
         namespace = target.get("namespace")  # None 허용(어댑터가 처리)
@@ -73,7 +94,6 @@ def collect(spec: dict) -> TrafficSnapshot:
             log.error("spec.target.httpRoute 누락 - 수집 대상 특정 불가")
             return _failed(now, window_seconds, meta={"error": "target.httpRoute missing"})
 
-        impl = _resolve_impl(spec)
         adapter = get_adapter(impl)
         client = _build_client(spec)
 
