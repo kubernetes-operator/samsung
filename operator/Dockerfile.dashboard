@@ -25,6 +25,10 @@ RUN pip install --no-cache-dir fastapi uvicorn kubernetes
 
 COPY k8s_traffic_operator/schemas.py k8s_traffic_operator/schemas.py
 COPY k8s_traffic_operator/__init__.py k8s_traffic_operator/__init__.py
+# hubble_client.py는 dashboard(/flows)와 policy 엔진이 공유한다. hubble_flows.py가
+# `from ..hubble_client import ...` 하므로 반드시 이미지에 포함해야 한다(누락 시 기동 즉시
+# ImportError). stdlib만 의존하므로 이 한 줄로 충분하다.
+COPY k8s_traffic_operator/hubble_client.py k8s_traffic_operator/hubble_client.py
 COPY k8s_traffic_operator/dashboard k8s_traffic_operator/dashboard
 
 # 대시보드는 읽기 전용이므로 root 권한이 필요 없다.
