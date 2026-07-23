@@ -15,22 +15,87 @@
 
 이 앱은 클러스터에 아무것도 쓰지 않는다. `data.fetch_policies()`/`hubble_flows.fetch_summary()`가
 유일한 접근 지점이며 조회만 수행한다.
+
+`/healthz`를 제외한 모든 경로는 HTTP Basic 인증으로 보호된다(자격증명은 env
+DASHBOARD_USERNAME/DASHBOARD_PASSWORD로 주입, 미설정 시 503 fail-closed). 아래 인증
+미들웨어 참고.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import html
+import os
+import secrets
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from . import data, hubble_flows
 from .data import PolicySummary
 from .hubble_flows import FlowSummary
 
 app = FastAPI(title="TrafficPolicy Dashboard", docs_url=None, redoc_url=None)
+
+# --------------------------------------------------------------------------- 인증(HTTP Basic)
+# 이 대시보드는 test2.studiobasa.com 아래로 공개 노출되므로 HTTP Basic 인증으로 보호한다.
+# 자격증명은 **코드/이미지에 절대 넣지 않고** 런타임 env(DASHBOARD_USERNAME/PASSWORD)로만
+# 주입한다(배포에서는 K8s Secret -> env). env가 비어 있으면 "설정 누락"으로 보고 모든 보호
+# 경로를 503으로 막는다(fail-closed) — 인증이 안 걸린 채 실수로 공개되는 상황을 방지.
+# /healthz만 예외(쿠버네티스 프로브가 자격증명 없이 접근해야 함).
+_AUTH_REALM = "TrafficPolicy Dashboard"
+_PUBLIC_PATHS = frozenset({"/healthz"})
+
+
+def _auth_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """설정된 (username, password)를 env에서 읽는다(요청마다 읽어 재기동 없이 반영/테스트 용이)."""
+    return os.getenv("DASHBOARD_USERNAME") or None, os.getenv("DASHBOARD_PASSWORD") or None
+
+
+def _parse_basic(header: str) -> Optional[Tuple[str, str]]:
+    """Authorization 헤더에서 Basic 자격증명을 (user, password)로 파싱. 형식 불량이면 None."""
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+    user, sep, password = decoded.partition(":")
+    if not sep:
+        return None
+    return user, password
+
+
+@app.middleware("http")
+async def _basic_auth(request: Request, call_next):
+    if request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    username, password = _auth_credentials()
+    if not username or not password:
+        # 자격증명 미설정 = 보호 불가 => 열어두지 않고 막는다(fail-closed).
+        return PlainTextResponse(
+            "Dashboard authentication is not configured (DASHBOARD_USERNAME/PASSWORD).",
+            status_code=503,
+        )
+
+    unauthorized = Response(
+        status_code=401,
+        headers={"WWW-Authenticate": f'Basic realm="{_AUTH_REALM}"'},
+    )
+    creds = _parse_basic(request.headers.get("Authorization", ""))
+    if creds is None:
+        return unauthorized
+    # 사용자명/비밀번호 모두 상수 시간 비교(타이밍 공격 방지). 단축 평가로 새지 않도록 둘 다 계산.
+    user_ok = secrets.compare_digest(creds[0], username)
+    pass_ok = secrets.compare_digest(creds[1], password)
+    if not (user_ok and pass_ok):
+        return unauthorized
+    return await call_next(request)
 
 _SEVERITY_COLOR = {"none": "#4b5563", "warning": "#b45309", "critical": "#b91c1c"}
 _PHASE_COLOR = {

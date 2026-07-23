@@ -6,6 +6,7 @@ list_cluster_custom_object/list_namespaced_custom_object 호출만 검증하면 
 
 from __future__ import annotations
 
+import base64
 import time
 from unittest.mock import MagicMock
 
@@ -15,6 +16,30 @@ from kubernetes.client.rest import ApiException
 
 from k8s_traffic_operator.dashboard import app as dashboard_app
 from k8s_traffic_operator.dashboard import data
+
+# 대시보드는 /healthz를 뺀 모든 경로가 HTTP Basic 인증으로 보호된다. 대부분의 테스트는
+# 엔드포인트의 '내용'을 검증하므로, 자격증명을 env로 세팅(autouse)하고 유효한 Authorization
+# 헤더를 기본 탑재한 클라이언트(_authed_client)를 쓴다. 인증 '동작' 자체는 별도 섹션에서 검증한다.
+_TEST_USER = "test-admin"
+_TEST_PASS = "test-secret-pw"
+
+
+def _basic_header(user: str, password: str) -> dict:
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+@pytest.fixture(autouse=True)
+def _dashboard_auth_env(monkeypatch):
+    """모든 테스트에서 인증이 '설정된' 상태가 되도록 env를 채운다(개별 테스트가 delenv로 덮어쓸 수 있음)."""
+    monkeypatch.setenv("DASHBOARD_USERNAME", _TEST_USER)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", _TEST_PASS)
+
+
+def _authed_client() -> TestClient:
+    client = TestClient(dashboard_app.app)
+    client.headers.update(_basic_header(_TEST_USER, _TEST_PASS))
+    return client
 
 
 def _cr(
@@ -139,11 +164,11 @@ def client_with_policies(monkeypatch):
         dashboard_app.data, "fetch_policies",
         lambda: [data._summarize(_cr(), time.time())],
     )
-    return TestClient(dashboard_app.app)
+    return _authed_client()
 
 
 def test_healthz():
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
@@ -159,7 +184,7 @@ def test_root_returns_html_table(client_with_policies):
 
 def test_root_shows_empty_state_when_no_policies(monkeypatch):
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/")
     assert resp.status_code == 200
     assert "없습니다" in resp.text
@@ -178,7 +203,7 @@ def test_html_escapes_untrusted_reason_field(monkeypatch):
     """CR의 reason 필드는 오퍼레이터가 생성하지만, 방어적으로 HTML 이스케이프 확인(XSS 방지)."""
     malicious = _cr(reason='<script>alert(1)</script>')
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [data._summarize(malicious, time.time())])
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/")
     assert "<script>alert(1)</script>" not in resp.text
     assert "&lt;script&gt;" in resp.text
@@ -187,7 +212,7 @@ def test_html_escapes_untrusted_reason_field(monkeypatch):
 def test_error_row_rendered_for_fetch_failure(monkeypatch):
     err_summary = data.PolicySummary(namespace="shop", name="(조회 실패)", phase="Error", raw_error="권한 없음: 403")
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [err_summary])
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/")
     assert "권한 없음" in resp.text
 
@@ -206,7 +231,7 @@ def test_flows_html_renders_verdicts_and_pairs(monkeypatch):
                     "dst_port": 8080, "count": 2, "last_seen": "2026-07-19T12:00:00.000000000Z"}],
     )
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/flows")
     assert resp.status_code == 200
     assert "shop/checkout-abc" in resp.text
@@ -218,14 +243,14 @@ def test_flows_html_renders_verdicts_and_pairs(monkeypatch):
 def test_flows_html_shows_fetch_error_explicitly(monkeypatch):
     summary = FlowSummary(fetch_error="hubble CLI를 찾을 수 없음")
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/flows")
     assert "hubble CLI를 찾을 수 없음" in resp.text
 
 
 def test_flows_html_shows_empty_state_when_zero_flows(monkeypatch):
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: FlowSummary(total=0))
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/flows")
     assert "관측된 흐름이 없습니다" in resp.text
 
@@ -235,7 +260,7 @@ def test_api_flows_returns_json(monkeypatch):
         "src": "a", "dst": "b", "protocol": "TCP", "dst_port": 80, "count": 5, "last_seen": "t",
     }])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/api/flows")
     payload = resp.json()
     assert payload["total"] == 5
@@ -249,7 +274,7 @@ def test_flows_html_escapes_pod_names_for_xss(monkeypatch):
         "dst_port": 80, "count": 1, "last_seen": "2026-07-19T12:00:00.000000000Z",
     }])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     resp = client.get("/flows")
     assert "<script>alert(1)</script>" not in resp.text
     assert "&lt;script&gt;" in resp.text
@@ -258,6 +283,61 @@ def test_flows_html_escapes_pod_names_for_xss(monkeypatch):
 def test_nav_links_present_on_both_pages(monkeypatch):
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: FlowSummary(total=0))
-    client = TestClient(dashboard_app.app)
+    client = _authed_client()
     assert 'href="/flows"' in client.get("/").text
     assert 'href="/"' in client.get("/flows").text
+
+
+# --------------------------------------------------------------------------- HTTP Basic 인증
+def test_healthz_is_public_without_credentials():
+    """프로브 경로 /healthz는 자격증명 없이도 200이어야 한다(k8s liveness/readiness)."""
+    resp = TestClient(dashboard_app.app).get("/healthz")
+    assert resp.status_code == 200
+
+
+def test_protected_route_requires_auth_returns_401_with_challenge(monkeypatch):
+    """자격증명 없이 보호 경로 접근 시 401 + WWW-Authenticate(Basic) 챌린지를 줘야 한다."""
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    resp = TestClient(dashboard_app.app).get("/")  # 인증 헤더 없음
+    assert resp.status_code == 401
+    assert resp.headers.get("WWW-Authenticate", "").lower().startswith("basic")
+
+
+def test_api_route_is_also_protected(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    resp = TestClient(dashboard_app.app).get("/api/policies")
+    assert resp.status_code == 401
+
+
+def test_wrong_credentials_rejected(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    client = TestClient(dashboard_app.app)
+    client.headers.update(_basic_header(_TEST_USER, "wrong-password"))
+    assert client.get("/").status_code == 401
+
+
+def test_malformed_authorization_header_rejected(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    client = TestClient(dashboard_app.app)
+    client.headers.update({"Authorization": "Basic not-valid-base64!!"})
+    assert client.get("/").status_code == 401
+
+
+def test_valid_credentials_allowed(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    resp = _authed_client().get("/")
+    assert resp.status_code == 200
+
+
+def test_unconfigured_auth_fails_closed_with_503(monkeypatch):
+    """DASHBOARD_USERNAME/PASSWORD 미설정이면 인증 불가 => 공개하지 않고 503으로 막는다."""
+    monkeypatch.delenv("DASHBOARD_USERNAME", raising=False)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    # 자격증명을 보내더라도 서버가 설정 안 됐으면 503(열리면 안 됨).
+    client = TestClient(dashboard_app.app)
+    client.headers.update(_basic_header(_TEST_USER, _TEST_PASS))
+    resp = client.get("/")
+    assert resp.status_code == 503
+    # 그래도 프로브는 살아 있어야 한다.
+    assert TestClient(dashboard_app.app).get("/healthz").status_code == 200
