@@ -48,7 +48,8 @@ _STYLE = """
   h1 { font-size: 1.25rem; margin-bottom: .25rem; }
   nav { margin-bottom: 1rem; font-size: .85rem; }
   nav a { color: #60a5fa; text-decoration: none; margin-right: 1rem; }
-  nav a.active { color: inherit; font-weight: 600; text-decoration: underline; }
+  a { color: #60a5fa; }
+  a.active { color: inherit; font-weight: 600; text-decoration: underline; }
   .meta { color: #9ca3af; font-size: .85rem; margin-bottom: 1.5rem; }
   table { width: 100%; border-collapse: collapse; font-size: .9rem; }
   th { text-align: left; padding: .5rem .75rem; border-bottom: 2px solid #374151; color: #9ca3af;
@@ -164,23 +165,45 @@ def _flow_pair_row_html(pair: dict) -> str:
     </tr>"""
 
 
+def _scope_toggle_html(scope: str) -> str:
+    """애플리케이션 전용/전체 트래픽 전환 링크."""
+    app_cls = "active" if scope == "app" else ""
+    all_cls = "active" if scope == "all" else ""
+    return (
+        '<div style="margin-bottom:1rem;font-size:.85rem">보기: '
+        f'<a href="/flows?scope=app" class="{app_cls}">내 애플리케이션 트래픽</a> · '
+        f'<a href="/flows?scope=all" class="{all_cls}">전체(인프라 포함)</a></div>'
+    )
+
+
 def _render_flows(summary: FlowSummary) -> str:
+    toggle = _scope_toggle_html(summary.scope)
+    scope_label = "내 애플리케이션 Pod" if summary.scope == "app" else "전체(인프라 포함)"
+
     if summary.fetch_error:
-        table = (
+        table = toggle + (
             f'<div class="error-row" style="padding:1rem">⚠ Hubble 조회 실패: '
             f'{html.escape(summary.fetch_error)}</div>'
         )
         meta = "Cilium Hubble 기반 실제 Pod 트래픽 흐름 · 조회 실패"
-    elif summary.total == 0:
-        table = '<div class="empty">관측된 흐름이 없습니다.</div>'
-        meta = "Cilium Hubble 기반 실제 Pod 트래픽 흐름 · 0건"
+    elif summary.shown == 0:
+        # 전체는 있는데 앱 흐름만 0인 경우와, 애초에 아무 흐름도 없는 경우를 구분해서 안내한다.
+        if summary.scope == "app" and summary.total > 0:
+            empty = (
+                '<div class="empty">최근 창에서 애플리케이션 Pod 흐름이 관측되지 않았습니다. '
+                '전체 흐름은 있으니 아래 "전체(인프라 포함)"로 확인하세요.</div>'
+            )
+        else:
+            empty = '<div class="empty">관측된 흐름이 없습니다.</div>'
+        table = toggle + empty
+        meta = f"Cilium Hubble 기반 · {scope_label} 0건 (전체 {summary.total}건)"
     else:
         badges = " ".join(
             f'<span class="badge" style="background:{_VERDICT_COLOR.get(v, "#4b5563")}">{html.escape(v)} {c}</span>'
             for v, c in summary.verdicts.items()
         )
         rows = "\n".join(_flow_pair_row_html(p) for p in summary.top_pairs)
-        table = f"""<div style="margin-bottom:1rem">{badges}</div>
+        table = toggle + f"""<div style="margin-bottom:1rem">{badges}</div>
 <table>
 <thead><tr>
   <th>Source</th><th></th><th>Destination</th><th>Proto</th><th>Count</th><th>Last Seen (UTC)</th>
@@ -188,13 +211,18 @@ def _render_flows(summary: FlowSummary) -> str:
 <tbody>{rows}</tbody>
 </table>"""
         meta = (
-            f"Cilium Hubble 기반 실제 Pod 트래픽 흐름(L3/L4, HTTP RPS 아님) · "
-            f"최근 {summary.total}건 중 상위 {len(summary.top_pairs)}개 연결 쌍"
+            f"Cilium Hubble 기반 실제 Pod 트래픽 흐름(L3/L4, HTTP RPS 아님) · {scope_label} · "
+            f"최근 전체 {summary.total}건 중 애플리케이션 {summary.app_flows}건, "
+            f"현재 보기 {summary.shown}건에서 상위 {len(summary.top_pairs)}개 연결 쌍"
         )
     return _page(
         active="flows", title="Pod Traffic Flows (Hubble)", heading="실시간 Pod 트래픽 흐름",
         meta=meta, table=table,
     )
+
+
+def _normalize_scope(scope: str) -> str:
+    return "all" if scope == "all" else "app"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -213,16 +241,19 @@ def api_policies():
 
 
 @app.get("/flows", response_class=HTMLResponse)
-def flows() -> str:
-    return _render_flows(hubble_flows.fetch_summary())
+def flows(scope: str = "app") -> str:
+    return _render_flows(hubble_flows.fetch_summary(scope=_normalize_scope(scope)))
 
 
 @app.get("/api/flows", response_class=JSONResponse)
-def api_flows():
-    summary = hubble_flows.fetch_summary()
+def api_flows(scope: str = "app"):
+    summary = hubble_flows.fetch_summary(scope=_normalize_scope(scope))
     return {
         "generatedAt": time.time(),
         "total": summary.total,
+        "shown": summary.shown,
+        "scope": summary.scope,
+        "appFlows": summary.app_flows,
         "verdicts": summary.verdicts,
         "topPairs": summary.top_pairs,
         "fetchError": summary.fetch_error,
