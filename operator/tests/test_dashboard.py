@@ -288,6 +288,35 @@ def test_nav_links_present_on_both_pages(monkeypatch):
     assert 'href="/"' in client.get("/flows").text
 
 
+def test_links_use_external_prefix_when_configured(monkeypatch):
+    """서브패스(/traffic-dashboard) 노출 시 nav/토글 링크가 프리픽스를 포함해야 한다.
+
+    프리픽스 없이 절대경로 '/flows'를 쓰면 브라우저가 프리픽스 밖으로 나가 게이트웨이에서
+    404가 난다(실제 발생했던 버그). 라우트 자체는 게이트웨이가 프리픽스를 떼므로 '/'/'/flows'.
+    """
+    monkeypatch.setenv("DASHBOARD_URL_PREFIX", "/traffic-dashboard")
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: FlowSummary(total=0))
+    client = _authed_client()
+
+    root_html = client.get("/").text
+    assert 'href="/traffic-dashboard/"' in root_html
+    assert 'href="/traffic-dashboard/flows"' in root_html
+
+    flows_html = client.get("/flows").text
+    # 스코프 토글 링크도 프리픽스를 포함해야 한다.
+    assert 'href="/traffic-dashboard/flows?scope=app"' in flows_html
+    assert 'href="/traffic-dashboard/flows?scope=all"' in flows_html
+
+
+def test_prefix_is_stripped_and_normalized(monkeypatch):
+    """트레일링 슬래시/누락된 선행 슬래시를 정규화한다."""
+    monkeypatch.setenv("DASHBOARD_URL_PREFIX", "traffic-dashboard/")
+    assert dashboard_app._url_prefix() == "/traffic-dashboard"
+    monkeypatch.setenv("DASHBOARD_URL_PREFIX", "")
+    assert dashboard_app._url_prefix() == ""
+
+
 # --------------------------------------------------------------------------- HTTP Basic 인증
 def test_healthz_is_public_without_credentials():
     """프로브 경로 /healthz는 자격증명 없이도 200이어야 한다(k8s liveness/readiness)."""

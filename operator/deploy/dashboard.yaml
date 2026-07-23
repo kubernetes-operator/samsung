@@ -72,6 +72,11 @@ spec:
               value: ""  # 비우면 클러스터 전체. 특정 네임스페이스만 보려면 채우고 위 RBAC도 좁힐 것.
             - name: HUBBLE_RELAY_ADDR
               value: "hubble-relay.kube-system.svc.cluster.local:80"  # /flows 페이지가 조회할 hubble-relay 주소.
+            # 이 대시보드는 test2.studiobasa.com/traffic-dashboard 아래로 노출된다(HTTPRoute가
+            # 프리픽스를 떼고 백엔드로 전달). 라우트는 '/','/flows'로 두되, HTML 링크에는 이
+            # 프리픽스를 붙여야 브라우저의 페이지 내 이동(nav/토글)이 프리픽스 밖으로 새지 않는다.
+            - name: DASHBOARD_URL_PREFIX
+              value: "/traffic-dashboard"
             # HTTP Basic 인증 자격증명. 값은 매니페스트/이미지에 넣지 않고 Secret에서 주입한다.
             # 이 Secret은 저장소에 커밋하지 않으며, 배포 담당자가 직접 만든다(예):
             #   kubectl -n traffic-policy-dashboard create secret generic traffic-policy-dashboard-auth \

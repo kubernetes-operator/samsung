@@ -142,8 +142,8 @@ _PAGE_TEMPLATE = """<!doctype html>
 </head>
 <body>
 <nav>
-  <a href="/" class="{nav_policies}">TrafficPolicy 현황</a>
-  <a href="/flows" class="{nav_flows}">실시간 Pod 트래픽 흐름 (Hubble)</a>
+  <a href="{prefix}/" class="{nav_policies}">TrafficPolicy 현황</a>
+  <a href="{prefix}/flows" class="{nav_flows}">실시간 Pod 트래픽 흐름 (Hubble)</a>
 </nav>
 <h1>{heading}</h1>
 <div class="meta">{meta}</div>
@@ -152,9 +152,24 @@ _PAGE_TEMPLATE = """<!doctype html>
 </html>"""
 
 
+def _url_prefix() -> str:
+    """대시보드가 외부에 노출되는 경로 프리픽스(예: '/traffic-dashboard').
+
+    Gateway(HTTPRoute)가 이 프리픽스를 떼고 백엔드로 전달하므로 FastAPI 라우트 자체는
+    '/', '/flows'로 두지만, HTML 안의 링크에는 이 프리픽스를 붙여야 브라우저가 프리픽스
+    포함 URL로 재요청한다(안 붙이면 '/flows'가 프리픽스 밖으로 나가 게이트웨이에서 404).
+    env DASHBOARD_URL_PREFIX로 설정하며, 비면(로컬 실행/테스트) 절대경로 그대로 쓴다.
+    """
+    raw = (os.getenv("DASHBOARD_URL_PREFIX") or "").strip().rstrip("/")
+    if raw and not raw.startswith("/"):
+        raw = "/" + raw
+    return raw
+
+
 def _page(*, active: str, title: str, heading: str, meta: str, table: str) -> str:
     return _PAGE_TEMPLATE.format(
         title=title, style=_STYLE, heading=heading, meta=meta, table=table,
+        prefix=_url_prefix(),
         nav_policies="active" if active == "policies" else "",
         nav_flows="active" if active == "flows" else "",
     )
@@ -232,12 +247,13 @@ def _flow_pair_row_html(pair: dict) -> str:
 
 def _scope_toggle_html(scope: str) -> str:
     """애플리케이션 전용/전체 트래픽 전환 링크."""
+    prefix = _url_prefix()
     app_cls = "active" if scope == "app" else ""
     all_cls = "active" if scope == "all" else ""
     return (
         '<div style="margin-bottom:1rem;font-size:.85rem">보기: '
-        f'<a href="/flows?scope=app" class="{app_cls}">내 애플리케이션 트래픽</a> · '
-        f'<a href="/flows?scope=all" class="{all_cls}">전체(인프라 포함)</a></div>'
+        f'<a href="{prefix}/flows?scope=app" class="{app_cls}">내 애플리케이션 트래픽</a> · '
+        f'<a href="{prefix}/flows?scope=all" class="{all_cls}">전체(인프라 포함)</a></div>'
     )
 
 
