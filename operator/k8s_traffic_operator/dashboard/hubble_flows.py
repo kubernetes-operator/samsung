@@ -26,7 +26,7 @@ SYSTEM_NAMESPACES는 환경변수 SYSTEM_NAMESPACES(콤마 구분)로 덮어쓸 
 from __future__ import annotations
 
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -90,17 +90,22 @@ def summarize(flows: List[FlowEvent], top_n: int = 15, scope: str = "app") -> Fl
     verdicts: Counter = Counter()
     pair_counts: Counter = Counter()
     pair_last_seen: Dict[tuple, str] = {}
+    pair_verdicts: Dict[tuple, Counter] = defaultdict(Counter)
 
     for ev in selected:
         verdicts[ev.verdict] += 1
         key = (ev.src.label, ev.dst.label, ev.protocol, ev.dst_port)
         pair_counts[key] += 1
+        pair_verdicts[key][ev.verdict] += 1
         pair_last_seen[key] = ev.time  # 뒤에서부터 덮어써도 마지막 관측 시각으로 수렴
 
     top_pairs = [
         {
             "src": src, "dst": dst, "protocol": proto, "dst_port": port,
             "count": count, "last_seen": pair_last_seen[(src, dst, proto, port)],
+            # 쌍별 '대표 verdict'(가장 많이 관측된 판정). 다이어그램에서 화살표 색을 이걸로 칠한다
+            # — 그 연결이 대체로 정상(FORWARDED)인지 차단(DROPPED)인지 한눈에 보이게.
+            "verdict": pair_verdicts[(src, dst, proto, port)].most_common(1)[0][0],
         }
         for (src, dst, proto, port), count in pair_counts.most_common(top_n)
     ]

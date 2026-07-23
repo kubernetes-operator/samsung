@@ -317,6 +317,54 @@ def test_prefix_is_stripped_and_normalized(monkeypatch):
     assert dashboard_app._url_prefix() == ""
 
 
+# --------------------------------------------------------------------------- 설명 패널 + 흐름 다이어그램
+def test_flows_page_shows_explanation_panel_even_when_empty(monkeypatch):
+    """데이터가 없어도 '이 페이지가 무엇인지' 설명 패널은 항상 보여야 한다."""
+    monkeypatch.setattr(
+        dashboard_app.hubble_flows, "fetch_summary",
+        lambda **kw: FlowSummary(total=0, shown=0, scope="app"),
+    )
+    text = _authed_client().get("/flows").text
+    assert 'class="help"' in text
+    assert "Hubble" in text
+    assert "연결 방향" in text  # 다이어그램 읽는 법 설명
+
+
+def test_flows_page_renders_inline_svg_diagram_when_data(monkeypatch):
+    summary = FlowSummary(
+        total=3, shown=3, app_flows=3, verdicts={"FORWARDED": 3},
+        top_pairs=[{
+            "src": "shop/checkout-abc", "dst": "shop/cart-def", "protocol": "TCP",
+            "dst_port": 8080, "count": 3, "verdict": "FORWARDED",
+            "last_seen": "2026-07-19T12:00:00.000000000Z",
+        }],
+    )
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert 'class="diagram"' in text
+    assert "<svg" in text and "marker-end" in text   # 화살표 있는 노드-링크 다이어그램
+    assert "shop/checkout-abc" in text               # source 노드 라벨
+    assert "shop/cart-def" in text                   # destination 노드 라벨
+
+
+def test_flow_diagram_svg_empty_for_no_pairs():
+    assert dashboard_app._flow_diagram_svg([]) == ""
+
+
+def test_flow_diagram_svg_limits_to_top_n():
+    """다이어그램은 가독성을 위해 상위 N개만 그린다(표에는 전체가 있음)."""
+    pairs = [
+        {"src": f"ns/src-{i}", "dst": f"ns/dst-{i}", "protocol": "TCP",
+         "dst_port": 80, "count": 100 - i, "verdict": "FORWARDED",
+         "last_seen": "2026-07-19T12:00:00Z"}
+        for i in range(20)
+    ]
+    svg = dashboard_app._flow_diagram_svg(pairs, limit=10)
+    # 상위 10개 source만 노드로 그려진다 — 11번째는 없어야 한다.
+    assert "ns/src-9" in svg
+    assert "ns/src-10" not in svg
+
+
 # --------------------------------------------------------------------------- HTTP Basic 인증
 def test_healthz_is_public_without_credentials():
     """프로브 경로 /healthz는 자격증명 없이도 200이어야 한다(k8s liveness/readiness)."""

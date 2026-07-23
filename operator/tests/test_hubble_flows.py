@@ -104,6 +104,21 @@ def test_summarize_counts_verdicts_and_pairs():
     assert summary.top_pairs[0]["count"] == 2
 
 
+def test_summarize_sets_dominant_verdict_per_pair():
+    """각 연결 쌍의 '대표 verdict'는 그 쌍에서 가장 많이 관측된 판정이어야 한다(다이어그램 색용)."""
+    events = [
+        _ev(dst_pod="cart-def", verdict="FORWARDED"),
+        _ev(dst_pod="cart-def", verdict="FORWARDED"),
+        _ev(dst_pod="cart-def", verdict="DROPPED"),   # cart는 2:1로 FORWARDED 우세
+        _ev(dst_pod="pay-xyz", verdict="DROPPED"),
+        _ev(dst_pod="pay-xyz", verdict="DROPPED"),    # pay는 DROPPED 우세
+    ]
+    summary = hf.summarize(events)
+    by_dst = {p["dst"]: p["verdict"] for p in summary.top_pairs}
+    assert by_dst["shop/cart-def"] == "FORWARDED"
+    assert by_dst["shop/pay-xyz"] == "DROPPED"
+
+
 def test_summarize_top_n_limits_output():
     events = [_ev(dst_pod=f"pod-{i}") for i in range(20)]
     summary = hf.summarize(events, top_n=5)

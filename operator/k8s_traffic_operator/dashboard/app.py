@@ -128,7 +128,13 @@ _STYLE = """
             font-size: .78rem; font-weight: 600; }
   .error-row td { color: #b91c1c; }
   .empty { color: #9ca3af; padding: 2rem 0; text-align: center; }
-  code { font-size: .82em; }
+  code { font-size: .82em; background: rgba(148,163,184,.18); padding: 0 .3rem; border-radius: .25rem; }
+  .help { border: 1px solid rgba(148,163,184,.28); border-radius: .5rem;
+          padding: .75rem 1rem; margin-bottom: 1rem; font-size: .9rem; line-height: 1.5; }
+  .help p { margin: .3rem 0; }
+  .diagram { overflow-x: auto; border: 1px solid rgba(148,163,184,.28); border-radius: .5rem;
+             padding: .5rem .75rem; margin-bottom: .25rem; }
+  .diagram-cap { color: #9ca3af; font-size: .78rem; margin: 0 0 1.25rem; }
 """
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -234,6 +240,8 @@ def _render_policies(policies: List[PolicySummary]) -> str:
 # --------------------------------------------------------------------------- Hubble 트래픽 흐름 (/flows)
 def _flow_pair_row_html(pair: dict) -> str:
     port = f":{pair['dst_port']}" if pair.get("dst_port") else ""
+    verdict = pair.get("verdict") or "-"
+    v_color = _VERDICT_COLOR.get(verdict, "#4b5563")
     return f"""
     <tr>
       <td>{html.escape(pair['src'])}</td>
@@ -241,8 +249,126 @@ def _flow_pair_row_html(pair: dict) -> str:
       <td>{html.escape(pair['dst'])}{html.escape(port)}</td>
       <td>{html.escape(pair['protocol'])}</td>
       <td><strong>{pair['count']}</strong></td>
+      <td><span class="badge" style="background:{v_color}">{html.escape(verdict)}</span></td>
       <td class="sub">{html.escape(pair['last_seen'][:19].replace('T', ' '))}</td>
     </tr>"""
+
+
+_VERDICT_LABEL_KO = {
+    "FORWARDED": "정상(허용)",
+    "DROPPED": "차단됨",
+    "ERROR": "오류",
+    "AUDIT": "감사(audit)",
+}
+
+
+def _flows_help_html() -> str:
+    """이 페이지가 무엇을 표현하는지 설명하는 상시 표시 패널(자동 새로고침에도 유지되도록 div)."""
+    legend = "".join(
+        f'<span style="display:inline-block;white-space:nowrap;margin:.1rem .8rem .1rem 0">'
+        f'<span class="badge" style="background:{_VERDICT_COLOR.get(v, "#4b5563")}">{v}</span> '
+        f"{html.escape(lbl)}</span>"
+        for v, lbl in _VERDICT_LABEL_KO.items()
+    )
+    return (
+        '<div class="help">'
+        "<p><strong>이 페이지는 무엇인가요?</strong> Cilium(CNI)의 <strong>Hubble</strong>이 관측한 "
+        "<em>실제 Pod 간 네트워크 연결</em>입니다(L3/L4 수준). 아래 다이어그램에서 "
+        "<strong>화살표</strong>는 연결 방향(source → destination), <strong>선 굵기</strong>는 "
+        "관측된 연결 수, <strong>색</strong>은 Cilium의 정책 <strong>판정(verdict)</strong>입니다.</p>"
+        f'<p>{legend}</p>'
+        '<p class="sub">· <strong>Count</strong>는 연결(flow) 수이며 HTTP 요청 수/RPS가 아닙니다. '
+        "· 목적지 포트는 라벨 뒤 <code>:포트</code>로 표시됩니다. "
+        "· <code>host</code>/<code>world</code>/<code>remote-node</code> 등은 개별 Pod이 아닌 "
+        "예약 대상(클러스터 외부·노드 자신 등)입니다. "
+        "· 이 화면은 <code>/</code>(정책 현황)와 <em>다른 데이터</em>입니다 — 그쪽은 오퍼레이터가 "
+        "Gateway 트래픽 지표로 내린 <em>스케일링 판단</em>, 여기는 CNI가 본 <em>실제 연결</em>입니다.</p>"
+        "</div>"
+    )
+
+
+def _shorten(label: str, n: int = 32) -> str:
+    return label if len(label) <= n else label[: n - 1] + "…"
+
+
+def _flow_diagram_svg(pairs: list, limit: int = 10) -> str:
+    """상위 연결 쌍을 source→destination 노드-링크(bipartite) 다이어그램으로 그린다.
+
+    외부 라이브러리/JS 없이 서버에서 인라인 SVG로 생성한다(자동 새로고침·오프라인에서도 동작).
+    선 굵기 ∝ 연결 수, 색 = 대표 verdict. 각 화살표에 <title>로 네이티브 hover 툴팁을 붙인다.
+    가독성을 위해 상위 `limit`개만 그리며(전체는 아래 표에 있음), 노드는 등장 순서로 배치한다.
+    """
+    pairs = [p for p in pairs[:limit]]
+    if not pairs:
+        return ""
+
+    def _dst_disp(p: dict) -> str:
+        return p["dst"] + (f":{p['dst_port']}" if p.get("dst_port") else "")
+
+    sources: List[str] = []
+    dests: List[str] = []
+    for p in pairs:
+        if p["src"] not in sources:
+            sources.append(p["src"])
+        dd = _dst_disp(p)
+        if dd not in dests:
+            dests.append(dd)
+
+    left_x, right_x, row_h, top, width = 250, 510, 34, 54, 760
+    src_y = {s: top + i * row_h for i, s in enumerate(sources)}
+    dst_y = {d: top + i * row_h for i, d in enumerate(dests)}
+    height = top + max(len(sources), len(dests)) * row_h + 12
+    max_count = max((p["count"] for p in pairs), default=1) or 1
+    xm = (left_x + right_x) / 2
+
+    used = {p.get("verdict") or "FORWARDED" for p in pairs}
+    markers = "".join(
+        f'<marker id="arw-{html.escape(v)}" markerWidth="8" markerHeight="8" refX="6.5" refY="3" '
+        f'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="{_VERDICT_COLOR.get(v, "#4b5563")}"/></marker>'
+        for v in used
+    )
+
+    edges = []
+    for p in pairs:
+        v = p.get("verdict") or "FORWARDED"
+        color = _VERDICT_COLOR.get(v, "#4b5563")
+        y1, y2 = src_y[p["src"]], dst_y[_dst_disp(p)]
+        sw = 1.5 + (p["count"] / max_count) * 7.5
+        tip = f'{p["src"]} → {_dst_disp(p)} · {p["protocol"]} · {p["count"]}건 · {v}'
+        edges.append(
+            f'<path d="M{left_x},{y1} C{xm},{y1} {xm},{y2} {right_x - 9},{y2}" fill="none" '
+            f'stroke="{color}" stroke-width="{sw:.1f}" stroke-opacity="0.7" '
+            f'marker-end="url(#arw-{html.escape(v)})"><title>{html.escape(tip)}</title></path>'
+        )
+
+    nodes = []
+    for s in sources:
+        y = src_y[s]
+        nodes.append(f'<circle cx="{left_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>')
+        nodes.append(
+            f'<text x="{left_x - 10}" y="{y + 4}" text-anchor="end" font-size="12" '
+            f'fill="currentColor">{html.escape(_shorten(s))}</text>'
+        )
+    for d in dests:
+        y = dst_y[d]
+        nodes.append(f'<circle cx="{right_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>')
+        nodes.append(
+            f'<text x="{right_x + 10}" y="{y + 4}" text-anchor="start" font-size="12" '
+            f'fill="currentColor">{html.escape(_shorten(d))}</text>'
+        )
+
+    headers = (
+        f'<text x="{left_x - 10}" y="28" text-anchor="end" font-size="11" fill="currentColor" '
+        f'opacity="0.55">SOURCE (연결 시작)</text>'
+        f'<text x="{right_x + 10}" y="28" text-anchor="start" font-size="11" fill="currentColor" '
+        f'opacity="0.55">DESTINATION (대상) : PORT</text>'
+    )
+    return (
+        f'<div class="diagram"><svg viewBox="0 0 {width} {height}" width="100%" '
+        f'style="max-width:{width}px;height:auto;display:block" role="img" '
+        f'aria-label="상위 Pod 연결 흐름 다이어그램">'
+        f"<defs>{markers}</defs>{headers}{''.join(edges)}{''.join(nodes)}</svg></div>"
+    )
 
 
 def _scope_toggle_html(scope: str) -> str:
@@ -259,10 +385,11 @@ def _scope_toggle_html(scope: str) -> str:
 
 def _render_flows(summary: FlowSummary) -> str:
     toggle = _scope_toggle_html(summary.scope)
+    help_panel = _flows_help_html()
     scope_label = "내 애플리케이션 Pod" if summary.scope == "app" else "전체(인프라 포함)"
 
     if summary.fetch_error:
-        table = toggle + (
+        table = toggle + help_panel + (
             f'<div class="error-row" style="padding:1rem">⚠ Hubble 조회 실패: '
             f'{html.escape(summary.fetch_error)}</div>'
         )
@@ -276,18 +403,24 @@ def _render_flows(summary: FlowSummary) -> str:
             )
         else:
             empty = '<div class="empty">관측된 흐름이 없습니다.</div>'
-        table = toggle + empty
+        table = toggle + help_panel + empty
         meta = f"Cilium Hubble 기반 · {scope_label} 0건 (전체 {summary.total}건)"
     else:
         badges = " ".join(
             f'<span class="badge" style="background:{_VERDICT_COLOR.get(v, "#4b5563")}">{html.escape(v)} {c}</span>'
             for v, c in summary.verdicts.items()
         )
+        diagram = _flow_diagram_svg(summary.top_pairs)
+        shown_in_diagram = min(10, len(summary.top_pairs))
+        diagram_cap = (
+            f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결 쌍 도식화 '
+            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 화살표에 마우스를 올리면 상세.</p>"
+        )
         rows = "\n".join(_flow_pair_row_html(p) for p in summary.top_pairs)
-        table = toggle + f"""<div style="margin-bottom:1rem">{badges}</div>
+        table = toggle + help_panel + diagram + diagram_cap + f"""<div style="margin-bottom:1rem">{badges}</div>
 <table>
 <thead><tr>
-  <th>Source</th><th></th><th>Destination</th><th>Proto</th><th>Count</th><th>Last Seen (UTC)</th>
+  <th>Source</th><th></th><th>Destination</th><th>Proto</th><th>Count</th><th>Verdict</th><th>Last Seen (UTC)</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>"""
