@@ -338,6 +338,55 @@ def test_flows_alias_still_works(monkeypatch):
     assert "Hubble" in _authed_client().get("/flows").text
 
 
+# --- 자동 새로고침(기본 1분 · 10초/30초/1분/10분/끄기 선택) ----------------
+def _flows_client(monkeypatch):
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    return _authed_client()
+
+
+def test_default_refresh_is_one_minute(monkeypatch):
+    """기본 자동 새로고침은 1분(60초)이어야 한다."""
+    assert 'http-equiv="refresh" content="60"' in _flows_client(monkeypatch).get("/").text
+
+
+def test_refresh_selector_has_all_five_options(monkeypatch):
+    text = _flows_client(monkeypatch).get("/").text
+    assert 'class="refresh-ctl"' in text
+    for label in ("10초", "30초", "1분", "10분", "안 함"):
+        assert label in text
+
+
+def test_refresh_override_changes_meta(monkeypatch):
+    c = _flows_client(monkeypatch)
+    assert 'content="10"' in c.get("/?refresh=10").text
+    assert 'content="600"' in c.get("/?refresh=600").text
+
+
+def test_refresh_off_removes_meta_tag(monkeypatch):
+    text = _flows_client(monkeypatch).get("/?refresh=off").text
+    assert 'http-equiv="refresh"' not in text
+    assert "refresh=off" in text            # 선택 컨트롤 링크는 그대로 있어야 함
+
+
+def test_invalid_refresh_falls_back_to_default(monkeypatch):
+    assert 'content="60"' in _flows_client(monkeypatch).get("/?refresh=bogus").text
+
+
+def test_refresh_preserved_in_flow_filter_links(monkeypatch):
+    """refresh 선택은 스코프/필터 링크에도 실려 새로고침 시 유지되어야 한다."""
+    text = _flows_client(monkeypatch).get("/?refresh=off").text
+    assert text.count("refresh=off") >= 2   # 스코프 토글(app/all) 등
+
+
+def test_policies_page_refresh_selector_and_meta(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    text = _authed_client().get("/policies?refresh=30").text
+    assert 'content="30"' in text
+    assert "자동 새로고침 30초" in text
+    assert "/policies?refresh=600" in text  # 옵션 링크가 정책 경로 기준
+
+
 def test_links_use_external_prefix_when_configured(monkeypatch):
     """서브패스(/traffic-dashboard) 노출 시 nav/토글 링크가 프리픽스를 포함해야 한다.
 
@@ -355,8 +404,9 @@ def test_links_use_external_prefix_when_configured(monkeypatch):
     assert 'href="/traffic-dashboard/policies"' in root_html
 
     # 스코프 토글 등 흐름 필터 링크도 프리픽스를 포함하고, 메인(루트) 기준이어야 한다.
-    assert 'href="/traffic-dashboard/?scope=app"' in root_html
-    assert 'href="/traffic-dashboard/?scope=all"' in root_html
+    # (링크에는 현재 refresh 값도 함께 실린다 — trailing quote 없이 검사.)
+    assert 'href="/traffic-dashboard/?scope=app' in root_html
+    assert 'href="/traffic-dashboard/?scope=all' in root_html
 
 
 def test_prefix_is_stripped_and_normalized(monkeypatch):
@@ -551,8 +601,8 @@ def test_flows_page_shows_namespace_filter_links(monkeypatch):
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
     text = _authed_client().get("/").text
     assert "네임스페이스:" in text
-    assert 'href="/?scope=app&amp;namespace=shop"' in text
-    assert 'href="/?scope=app&amp;namespace=pay"' in text
+    assert 'href="/?scope=app&amp;namespace=shop' in text
+    assert 'href="/?scope=app&amp;namespace=pay' in text
     assert ">shop</a>" in text and "(5)" in text
 
 
@@ -580,7 +630,7 @@ def test_flows_focus_banner_and_clear_link(monkeypatch):
     assert "shop/checkout-abc" in text
     assert "선택 해제" in text
     # 해제 링크는 scope/namespace는 유지하되 focus는 빠진다(메인=루트 기준).
-    assert 'href="/?scope=app&amp;namespace=shop"' in text
+    assert 'href="/?scope=app&amp;namespace=shop' in text
 
 
 def test_flows_scope_toggle_preserves_namespace_and_focus(monkeypatch):

@@ -3,7 +3,7 @@
 실행:
     uvicorn k8s_traffic_operator.dashboard.app:app --host 0.0.0.0 --port 8080
 
-- `GET /`             : 메인 화면 = Cilium Hubble 기반 실제 Pod 트래픽 흐름 HTML (10초마다 자동 새로고침)
+- `GET /`             : 메인 화면 = Cilium Hubble 기반 실제 Pod 트래픽 흐름 HTML (기본 1분마다 자동 새로고침, ?refresh로 10초/30초/1분/10분/끄기 선택)
 - `GET /flows`        : 위와 동일한 트래픽 흐름 HTML (예전 링크 호환용 별칭)
 - `GET /policies`     : TrafficPolicy 현황 HTML (메뉴바의 '정책 현황')
 - `GET /api/flows`    : 트래픽 흐름 데이터의 JSON
@@ -59,6 +59,42 @@ _current_user_var: contextvars.ContextVar = contextvars.ContextVar("dashboard_us
 
 def current_user() -> Optional[str]:
     return _current_user_var.get()
+
+
+# --------------------------------------------------------------------------- 자동 새로고침
+# 콘텐츠 페이지(트래픽 흐름/정책 현황)는 meta http-equiv=refresh로 주기적으로 다시 로드된다.
+# 기본 1분이며 쿼리 `refresh`로 10초/30초/1분/10분/끄기를 고를 수 있다. meta refresh는 현재
+# URL을 그대로 다시 부르므로, refresh 값을 각 링크에 실어두면 필터/선택이 새로고침에도 유지된다.
+_REFRESH_OPTIONS = [("10", "10초"), ("30", "30초"), ("60", "1분"), ("600", "10분"), ("off", "안 함")]
+_REFRESH_LABELS = dict(_REFRESH_OPTIONS)
+_REFRESH_ALLOWED = frozenset(_REFRESH_LABELS)
+_REFRESH_DEFAULT = "60"  # 기본 1분
+_refresh_var: contextvars.ContextVar = contextvars.ContextVar("dashboard_refresh", default=_REFRESH_DEFAULT)
+
+
+def _normalize_refresh(value: Optional[str]) -> str:
+    """허용 집합(10/30/60/600/off) 밖이면 기본값(1분)으로."""
+    value = (value or "").strip()
+    return value if value in _REFRESH_ALLOWED else _REFRESH_DEFAULT
+
+
+def _refresh_meta_tag() -> str:
+    r = _refresh_var.get()
+    return "" if r == "off" else f'<meta http-equiv="refresh" content="{int(r)}">'
+
+
+def _refresh_selector_html(option_url) -> str:
+    """자동 새로고침 선택 컨트롤. `option_url(value)`가 각 옵션의 링크 URL을 만든다."""
+    cur = _refresh_var.get()
+    parts = [
+        f'<a href="{html.escape(option_url(val))}" class="{"active" if val == cur else ""}">'
+        f"{html.escape(label)}</a>"
+        for val, label in _REFRESH_OPTIONS
+    ]
+    return (
+        '<div class="refresh-ctl" style="margin-bottom:.75rem;font-size:.85rem">'
+        "자동 새로고침: " + " · ".join(parts) + "</div>"
+    )
 
 
 def _parse_basic(header: str) -> Optional[Tuple[str, str]]:
@@ -227,7 +263,7 @@ _PAGE_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<meta http-equiv="refresh" content="10">
+{refresh_meta}
 <style>{style}</style>
 </head>
 <body>
@@ -242,6 +278,7 @@ _PAGE_TEMPLATE = """<!doctype html>
 <main>
   <h2 class="page-title">{heading}</h2>
   <div class="meta">{meta}</div>
+  {refresh}
   {table}
 </main>
 </body>
@@ -278,7 +315,8 @@ def _url_prefix() -> str:
     return raw
 
 
-def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[str] = None,
+               refresh: Optional[str] = None) -> str:
     """트래픽 흐름(메인) 링크를 프리픽스 + 현재 필터(scope/namespace/focus)를 담은 URL로 만든다.
 
     트래픽 흐름이 메인 화면('/')이므로 루트 기준으로 URL을 만든다(레거시 '/flows'도 동일 내용).
@@ -291,6 +329,8 @@ def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[s
         query["namespace"] = namespace
     if focus:
         query["focus"] = focus
+    # 현재(또는 지정한) 새로고침 값을 모든 흐름 링크에 실어, 필터를 눌러도 선택이 유지되게 한다.
+    query["refresh"] = refresh or _refresh_var.get()
     return f"{_url_prefix()}/?{urlencode(query)}"
 
 
@@ -302,10 +342,12 @@ def _clean_param(value: Optional[str], max_len: int = 512) -> Optional[str]:
     return value or None
 
 
-def _page(*, active: str, title: str, heading: str, meta: str, table: str) -> str:
+def _page(*, active: str, title: str, heading: str, meta: str, table: str,
+          refresh_html: str = "") -> str:
     return _PAGE_TEMPLATE.format(
         title=title, style=_STYLE, heading=heading, meta=meta, table=table,
         prefix=_url_prefix(), userbox=_userbox_html(),
+        refresh_meta=_refresh_meta_tag(), refresh=refresh_html,
         nav_policies="active" if active == "policies" else "",
         nav_flows="active" if active == "flows" else "",
     )
@@ -360,10 +402,13 @@ def _render_policies(policies: List[PolicySummary]) -> str:
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>"""
+    prefix = _url_prefix()
+    refresh_html = _refresh_selector_html(
+        lambda val: f"{prefix}/policies?{urlencode({'refresh': val})}")
     return _page(
         active="policies", title="TrafficPolicy Dashboard", heading="정책 현황",
-        meta=f"트래픽 기반 자동운영 오퍼레이터 · 읽기 전용 · 10초마다 새로고침 · {len(policies)}개 정책",
-        table=table,
+        meta=f"트래픽 기반 자동운영 오퍼레이터 · 읽기 전용 · 자동 새로고침 {_REFRESH_LABELS[_refresh_var.get()]} · {len(policies)}개 정책",
+        table=table, refresh_html=refresh_html,
     )
 
 
@@ -778,9 +823,11 @@ def _render_flows(summary: FlowSummary) -> str:
             f"최근 전체 {summary.total}건 중 애플리케이션 {summary.app_flows}건, "
             f"현재 보기 {summary.shown}건에서 상위 {len(summary.top_pairs)}개 연결 쌍"
         )
+    refresh_html = _refresh_selector_html(lambda val: _flows_url(
+        scope=summary.scope, namespace=summary.namespace, focus=summary.focus, refresh=val))
     return _page(
         active="flows", title="Pod Traffic Flows (Hubble)", heading="실시간 Pod 트래픽 흐름",
-        meta=meta, table=table,
+        meta=meta, table=table, refresh_html=refresh_html,
     )
 
 
@@ -797,20 +844,25 @@ def _flows_response(scope: str, namespace: Optional[str], focus: Optional[str]) 
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+def dashboard(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None,
+              refresh: str = _REFRESH_DEFAULT) -> str:
     """메인 화면 = 실시간 트래픽 흐름(Hubble)."""
+    _refresh_var.set(_normalize_refresh(refresh))
     return _flows_response(scope, namespace, focus)
 
 
 @app.get("/flows", response_class=HTMLResponse)
-def flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+def flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None,
+          refresh: str = _REFRESH_DEFAULT) -> str:
     """레거시 별칭 — 예전 '/flows' 북마크/링크 호환용. 메인('/')과 동일한 내용."""
+    _refresh_var.set(_normalize_refresh(refresh))
     return _flows_response(scope, namespace, focus)
 
 
 @app.get("/policies", response_class=HTMLResponse)
-def policies_page() -> str:
+def policies_page(refresh: str = _REFRESH_DEFAULT) -> str:
     """TrafficPolicy 정책 현황(오퍼레이터 판단 결과). 메뉴바의 '정책 현황'."""
+    _refresh_var.set(_normalize_refresh(refresh))
     return _render_policies(data.fetch_policies())
 
 
