@@ -483,13 +483,31 @@ def test_help_panel_is_below_diagram(monkeypatch):
     assert text.index('class="diagram"') < text.index('class="help"')
 
 
-def test_diagram_renders_at_natural_size(monkeypatch):
-    """다이어그램은 컨테이너에 맞춰 축소하지 않고 자연 크기(px width/height)로 렌더된다(크게)."""
-    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: _one_pair_summary())
+def test_diagram_is_vertical_and_fits_width(monkeypatch):
+    """다이어그램은 세로(위→아래) 흐름이라 폭은 컨테이너에 맞추고(가로 스크롤 없음) 높이는 늘어난다."""
+    summary = FlowSummary(
+        total=2, shown=2, app_flows=2, verdicts={"FORWARDED": 2},
+        nodes=[
+            {"label": "a/x", "namespace": "a", "workload": None, "kind": "app", "layer": 0},
+            {"label": "a/y", "namespace": "a", "workload": None, "kind": "app", "layer": 1},
+            {"label": "a/z", "namespace": "a", "workload": None, "kind": "app", "layer": 2},
+        ],
+        top_pairs=[
+            {"src": "a/x", "dst": "a/y", "protocol": "TCP", "dst_port": 80, "count": 5,
+             "verdict": "FORWARDED", "last_seen": "2026-07-19T12:00:00Z"},
+            {"src": "a/y", "dst": "a/z", "protocol": "TCP", "dst_port": 80, "count": 3,
+             "verdict": "FORWARDED", "last_seen": "2026-07-19T12:00:00Z"},
+        ],
+    )
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
     text = _authed_client().get("/flows").text
     svg = text.split('class="diagram"')[1].split("</svg>")[0]
-    assert 'width="100%"' not in svg                    # 축소용 100% 아님
-    assert re.search(r'<svg[^>]*width="\d+"[^>]*height="\d+"', svg)  # 자연 px 크기
+    # 폭은 100%로 컨테이너에 맞춤(+자연 폭까지만 커지도록 max-width) → 좌우 스크롤 없음.
+    assert 'width="100%"' in svg and "max-width:" in svg
+    # viewBox가 세로로 더 김(3-hop 사슬이라 높이 > 폭).
+    m = re.search(r'viewBox="0 0 (\d+) (\d+)"', svg)
+    w, h = int(m.group(1)), int(m.group(2))
+    assert h > w
 
 
 def test_flow_graph_svg_limits_to_top_n():
@@ -564,9 +582,9 @@ def test_flows_page_includes_flow_animation_css(monkeypatch):
 
 
 def test_flow_graph_svg_spreads_edge_ports_to_avoid_overlap():
-    """한 노드에서 나가는 여러 간선이 한 점에 몰리지 않고 서로 다른 y에서 출발해야 한다.
+    """한 노드에서 나가는 여러 간선이 한 점에 몰리지 않고 서로 다른 x에서 출발해야 한다.
 
-    (화살표 겹침 방지 — 포트를 칩 높이에 분산 배치했는지 검증.)
+    (세로 흐름 — 포트를 칩 '가로 폭'에 분산 배치했는지 검증.)
     """
     import re
     nodes = [
@@ -580,10 +598,10 @@ def test_flow_graph_svg_spreads_edge_ports_to_avoid_overlap():
         for t in ("b", "c", "d")
     ]
     svg = dashboard_app._flow_graph_svg(nodes, edges)
-    # 간선(cubic 'C' 포함)의 시작 y좌표만 뽑는다(화살표 마커 path는 'L'이라 제외됨).
-    starts = re.findall(r'<path d="M[\d.]+,([\d.]+) C', svg)
+    # 간선(cubic 'C' 포함)의 시작 x좌표만 뽑는다(화살표 마커 path는 'L'이라 제외됨).
+    starts = re.findall(r'<path d="M([\d.]+),[\d.]+ C', svg)
     assert len(starts) == 3
-    assert len(set(starts)) == 3   # 세 간선이 서로 다른 지점에서 출발
+    assert len(set(starts)) == 3   # 세 간선이 서로 다른 x 지점에서 출발
 
 
 def test_flow_graph_svg_nodes_are_focus_links():

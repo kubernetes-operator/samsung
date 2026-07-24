@@ -502,9 +502,9 @@ def _flows_help_html() -> str:
         "화살표 가운데 <strong>숫자</strong>가 실제 관측된 연결 수이고, <strong>색</strong>은 "
         "Cilium의 정책 <strong>판정(verdict)</strong>입니다.</p>"
         "<p>다이어그램은 <strong>멀티홉 흐름 그래프</strong>입니다 — 각 리소스를 한 번만 그리고 "
-        "<strong>왼쪽에서 오른쪽으로 갈수록 다음 단계(hop)</strong>로 이어집니다. 그래서 "
+        "<strong>위에서 아래로 갈수록 다음 단계(hop)</strong>로 이어집니다. 그래서 "
         "<code>A→B</code>와 <code>B→C</code>가 같이 관측되면 <code>A→B→C</code> 사슬로 연결돼 "
-        "보입니다(1:1 쌍은 인접한 두 열). 각 <strong>칩</strong>은 흐름에 참여한 리소스이며, "
+        "보입니다(1:1 쌍은 인접한 두 행). 각 <strong>칩</strong>은 흐름에 참여한 리소스이며, "
         "윗줄은 <code>네임스페이스/Pod</code>, 아랫줄(<code>▸</code>)은 그 <strong>워크로드</strong>"
         "(Deployment/DaemonSet 등)입니다. 칩 테두리 색은 앱/인프라/예약 구분입니다.</p>"
         f'<p>{legend}</p>'
@@ -538,10 +538,11 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
                     namespace: Optional[str] = None) -> str:
     """상위 연결을 계층형(멀티홉) 노드-링크 그래프로 그린다 — '다음 단계로 이어지는' 흐름 시각화.
 
-    bipartite(좌=source, 우=destination)와 달리 각 리소스를 한 번만 그리고, 진입점에서의 홉
-    수(layer)에 따라 왼→오 열로 배치한다. 그래서 A→B, B→C 가 있으면 A→B→C 사슬로 이어져
-    보인다(1:1 쌍은 인접 두 열). 각 노드는 리소스 칩(라벨=ns/pod, 아래줄=워크로드/성격)이며
-    클릭하면 그 리소스에 focus가 걸린다. 선 굵기 ∝ 연결 수, 색 = 대표 verdict.
+    각 리소스를 한 번만 그리고, 진입점에서의 홉 수(layer)에 따라 **위→아래 행**으로 쌓는다
+    (한 행의 노드는 가로로 편다). 그래서 A→B, B→C 가 있으면 A→B→C 사슬로 아래로 이어져
+    보인다(1:1 쌍은 인접 두 행). 세로를 주 축으로 두어 깊은 사슬도 가로 스크롤 없이 아래로만
+    길어진다. 각 노드는 리소스 칩(라벨=ns/pod, 아래줄=워크로드/성격)이며 클릭하면 그 리소스에
+    focus가 걸린다. 화살표 두께는 균일, 색 = 대표 verdict.
 
     외부 라이브러리/JS 없이 서버 인라인 SVG로 생성(자동 새로고침·오프라인 동작). 가독성을 위해
     상위 `limit`개 간선만 그리며(전체는 아래 표), 그 간선에 닿는 노드만 그린다.
@@ -595,53 +596,55 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             idx = _index()
             columns[L].sort(key=lambda n, idx=idx: _bary(n, out_adj, idx))
 
-    # --- 좌표 배치. '크게'(가독) 요구에 맞춰 칩/열/행 간격을 키운다(약 1.35x).
-    chip_h, row_h, pad_top, pad_x, col_gap = 46, 82, 58, 22, 210
-    slot_w = {
-        L: max(_chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26)) for n in columns[L])
-        for L in columns
-    }
+    # --- 좌표 배치(세로 흐름). 계층(hop)을 위→아래로 쌓고, 한 계층의 노드는 가로로 편다.
+    # 주 축을 세로로 두면 깊은 사슬은 '아래로' 길어지고 가로 폭은 컨테이너에 맞아 좌우 스크롤이
+    # 안 생긴다(크기는 그대로 크게 유지). 칩 높이/폰트는 확대값 그대로.
+    chip_h, lay_gap, node_hgap, pad_top, pad_x = 46, 112, 30, 50, 22
     node_cw = {
         n["label"]: _chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26))
         for L in columns for n in columns[L]
     }
-    col_x, acc = {}, float(pad_x)
+    # 계층별 세로 위치(위→아래).
+    layer_y, acc = {}, float(pad_top)
     for L in range(max_layer + 1):
-        col_x[L] = acc
-        acc += slot_w.get(L, 90) + col_gap
-    width = acc - col_gap + pad_x
-    content_right = width   # self-loop 고리가 더 오른쪽으로 나가면 아래 루프에서 확장
+        layer_y[L] = acc
+        acc += chip_h + lay_gap
+    content_bottom = layer_y[max_layer] + chip_h  # 역방향 우회/self-loop이 더 내려가면 아래서 확장
 
-    rows = max((len(c) for c in columns.values()), default=1)
-    node_y = {}
+    # 계층별 가로 폭(칩 폭 합 + 간격) → 가장 넓은 계층 기준 전체 폭, 각 계층을 가로 가운데 정렬.
+    layer_w = {
+        L: sum(node_cw[n["label"]] for n in columns[L]) + node_hgap * max(0, len(columns[L]) - 1)
+        for L in columns
+    }
+    content_width = max(layer_w.values(), default=90.0) + 2 * pad_x
+    node_x = {}
     for L in range(max_layer + 1):
-        cnt = len(columns.get(L, []))
-        offset = (rows - cnt) * row_h / 2.0   # 짧은 열은 세로 가운데 정렬 → 가파른 대각선/겹침 감소
-        for i, n in enumerate(columns[L]):
-            node_y[n["label"]] = pad_top + offset + i * row_h
-    content_bottom = pad_top + rows * row_h   # 노드 영역 하단(역방향 우회선 bow가 더 내려가면 아래서 확장)
+        x = (content_width - layer_w.get(L, 0.0)) / 2.0   # 가운데 정렬
+        for n in columns[L]:
+            node_x[n["label"]] = x
+            x += node_cw[n["label"]] + node_hgap
+    content_right = content_width  # 역방향 우회선이 더 오른쪽으로 나가면 아래 루프에서 확장
 
-    # --- 포트 분산: 한 노드에 여러 간선이 붙을 때 연결 지점을 칩 높이에 고루 나눠, 화살표가
-    # 한 점에 몰려 겹치는 것을 막는다. 각 노드의 나가는/들어오는 간선을 상대편 y로 정렬해
-    # 위→아래 순서대로 포트를 배정하면 선끼리 교차도 줄어든다.
+    # --- 포트 분산: 한 노드에 여러 간선이 붙을 때 연결 지점을 칩 '가로 폭'에 고루 나눠 겹침을
+    # 막는다. 나가는/들어오는 간선을 상대편 x로 정렬해 좌→우로 포트를 배정하면 교차도 줄어든다.
     out_e: dict = defaultdict(list)
     in_e: dict = defaultdict(list)
     for i, e in enumerate(edges):
         out_e[e["src"]].append(i)
         in_e[e["dst"]].append(i)
     for lst in out_e.values():
-        lst.sort(key=lambda i: node_y[edges[i]["dst"]])
+        lst.sort(key=lambda i: node_x[edges[i]["dst"]])
     for lst in in_e.values():
-        lst.sort(key=lambda i: node_y[edges[i]["src"]])
-    src_py, dst_py = {}, {}
+        lst.sort(key=lambda i: node_x[edges[i]["src"]])
+    src_px, dst_px = {}, {}
     for lbl, lst in out_e.items():
         k = len(lst)
         for j, i in enumerate(lst):
-            src_py[i] = node_y[lbl] + chip_h * (j + 1) / (k + 1)
+            src_px[i] = node_x[lbl] + node_cw[lbl] * (j + 1) / (k + 1)
     for lbl, lst in in_e.items():
         k = len(lst)
         for j, i in enumerate(lst):
-            dst_py[i] = node_y[lbl] + chip_h * (j + 1) / (k + 1)
+            dst_px[i] = node_x[lbl] + node_cw[lbl] * (j + 1) / (k + 1)
 
     max_count = max((e["count"] for e in edges), default=1) or 1
     min_count = min((e["count"] for e in edges), default=1)
@@ -668,24 +671,24 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         d_layer = by_label[e["dst"]]["layer"]
         port = f":{e['dst_port']}" if e.get("dst_port") else ""
         tip = f'{e["src"]} → {e["dst"]}{port} · {e["protocol"]} · {e["count"]}건 · {v}'
+        ARROW_GAP = 11
         if e["src"] == e["dst"]:
-            # 자기 자신으로의 흐름: 칩 오른쪽에 작은 고리로 그린다(드묾).
-            x = col_x[s_layer] + node_cw[e["src"]]
-            y = src_py[i]
-            content_right = max(content_right, x + 56)  # 고리가 오른쪽으로 잘리지 않게 폭 확장
-            p0, c1, c2, p3 = (x, y), (x + 56, y - 30), (x + 56, y + 30), (x, y + 4)
-        else:
-            sx = col_x[s_layer] + node_cw[e["src"]]
-            sy = src_py[i]
-            ex = col_x[d_layer] - 11
-            ey = dst_py[i]
-            if ex > sx:  # 정방향(왼→오): 수평 중간점을 제어점으로 하는 S커브.
-                cx = (sx + ex) / 2
-                p0, c1, c2, p3 = (sx, sy), (cx, sy), (cx, ey), (ex, ey)
-            else:  # 역방향(순환): 아래로 우회(제어점 x는 두 노드 사이로 유지 → 좌우로 안 삐져나감).
-                bow = max(sy, ey) + row_h * 0.9
-                content_bottom = max(content_bottom, bow)  # 우회선이 뷰박스 밖으로 잘리지 않게 높이 확장
-                p0, c1, c2, p3 = (sx, sy), (sx, bow), (ex, bow), (ex, ey)
+            # 자기 자신으로의 흐름: 칩 아래에 작은 고리로 그린다(드묾).
+            x = node_x[e["src"]] + node_cw[e["src"]] / 2
+            y = layer_y[s_layer] + chip_h
+            content_bottom = max(content_bottom, y + 46)  # 고리가 아래로 잘리지 않게 높이 확장
+            p0, c1, c2, p3 = (x, y), (x - 28, y + 44), (x + 28, y + 44), (x, y + 3)
+        elif d_layer > s_layer:  # 정방향(위→아래): 세로 중간점을 제어점으로 하는 S커브.
+            sx, sy = src_px[i], layer_y[s_layer] + chip_h        # 출발 = 칩 아래 변
+            ex, ey = dst_px[i], layer_y[d_layer] - ARROW_GAP     # 도착 = 다음 칩 위 변
+            cy = (sy + ey) / 2
+            p0, c1, c2, p3 = (sx, sy), (sx, cy), (ex, cy), (ex, ey)
+        else:  # 역방향/동일계층(순환): 오른쪽으로 우회(위→아래 흐름을 방해하지 않게).
+            sx, sy = src_px[i], layer_y[s_layer]                 # 출발 = 칩 위 변
+            ex, ey = dst_px[i], layer_y[d_layer] + chip_h + ARROW_GAP  # 도착 = 대상 칩 아래 변
+            bow = max(sx, ex, content_width - pad_x) + 48
+            content_right = max(content_right, bow + 12)         # 우회선이 잘리지 않게 폭 확장
+            p0, c1, c2, p3 = (sx, sy), (bow, sy), (bow, ey), (ex, ey)
         d = (f"M{p0[0]:.0f},{p0[1]:.0f} C{c1[0]:.0f},{c1[1]:.0f} "
              f"{c2[0]:.0f},{c2[1]:.0f} {p3[0]:.0f},{p3[1]:.0f}")
         # 연결 많을수록 흐름 주기를 짧게(=빠르게). 상대 빈도(min~max) 기준. d를 attr 맨 앞에 둔다.
@@ -706,8 +709,8 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
 
     node_svg = []
     for lbl, n in by_label.items():
-        x = col_x[n["layer"]]
-        y = node_y[lbl]
+        x = node_x[lbl]
+        y = layer_y[n["layer"]]
         cw = node_cw[lbl]
         stroke = _KIND_STROKE.get(n["kind"], "#9ca3af")
         fill = _KIND_FILL.get(n["kind"], "none")
@@ -732,14 +735,14 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
 
     caption = (
         f'<text x="{pad_x}" y="34" font-size="13" fill="currentColor" opacity="0.6">'
-        f'→ 오른쪽으로 갈수록 다음 단계(hop) · 칩=리소스, 아래줄=워크로드</text>'
+        f'↓ 아래로 갈수록 다음 단계(hop) · 칩=리소스, 아래줄=워크로드</text>'
     )
-    # '크게' 요구: 컨테이너에 맞춰 축소하지 않고 자연 크기(px)로 렌더한다(축소하면 커진 효과가
-    # 사라짐). 자연 폭이 화면보다 넓으면 .diagram(overflow-x:auto)이 가로 스크롤한다.
+    # 세로 흐름이라 폭은 컨테이너에 맞추고(가로 스크롤 없음) 높이는 자연히 늘어난다. width="100%"
+    # + max-width로 자연 폭까지만 커지므로, 폭이 화면보다 좁으면 큰 크기 그대로, 넓으면 축소만 된다.
     return (
-        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" '
-        f'width="{width:.0f}" height="{height:.0f}" style="display:block" role="img" '
-        f'aria-label="멀티홉 Pod 트래픽 흐름 그래프">'
+        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" width="100%" '
+        f'style="max-width:{width:.0f}px;height:auto;display:block" role="img" '
+        f'aria-label="멀티홉 Pod 트래픽 흐름 그래프(세로)">'
         f"<defs>{markers}</defs>{caption}{''.join(edge_svg)}{''.join(node_svg)}</svg></div>"
     )
 
@@ -840,7 +843,7 @@ def _render_flows(summary: FlowSummary) -> str:
         shown_in_diagram = min(10, len(summary.top_pairs))
         diagram_cap = (
             f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결을 멀티홉 그래프로 도식화 '
-            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 왼→오 = 다음 단계(hop) · "
+            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 위→아래 = 다음 단계(hop) · "
             "화살표는 전기 흐르듯 애니메이션(연결 잦을수록 빠름), 가운데 숫자 = 실제 연결 수 · "
             "선 위 마우스 = 상세, 칩 클릭 = 그 리소스 연결만 보기.</p>"
         )
