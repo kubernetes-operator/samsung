@@ -383,6 +383,29 @@ def test_flow_graph_svg_renders_multihop_chain():
     assert "▸ front" in svg and "▸ mid" in svg and "▸ back" in svg
 
 
+def test_flow_graph_svg_spreads_edge_ports_to_avoid_overlap():
+    """한 노드에서 나가는 여러 간선이 한 점에 몰리지 않고 서로 다른 y에서 출발해야 한다.
+
+    (화살표 겹침 방지 — 포트를 칩 높이에 분산 배치했는지 검증.)
+    """
+    import re
+    nodes = [
+        {"label": "hub", "namespace": "shop", "workload": None, "kind": "app", "layer": 0},
+        {"label": "b", "namespace": "shop", "workload": None, "kind": "app", "layer": 1},
+        {"label": "c", "namespace": "shop", "workload": None, "kind": "app", "layer": 1},
+        {"label": "d", "namespace": "shop", "workload": None, "kind": "app", "layer": 1},
+    ]
+    edges = [
+        {"src": "hub", "dst": t, "protocol": "TCP", "dst_port": 80, "count": 1, "verdict": "FORWARDED"}
+        for t in ("b", "c", "d")
+    ]
+    svg = dashboard_app._flow_graph_svg(nodes, edges)
+    # 간선(cubic 'C' 포함)의 시작 y좌표만 뽑는다(화살표 마커 path는 'L'이라 제외됨).
+    starts = re.findall(r'<path d="M[\d.]+,([\d.]+) C', svg)
+    assert len(starts) == 3
+    assert len(set(starts)) == 3   # 세 간선이 서로 다른 지점에서 출발
+
+
 def test_flow_graph_svg_nodes_are_focus_links():
     nodes = [{"label": "shop/a", "namespace": "shop", "workload": None, "kind": "app", "layer": 0}]
     edges = [{"src": "shop/a", "dst": "shop/b", "protocol": "TCP", "dst_port": 80,

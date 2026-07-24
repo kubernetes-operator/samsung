@@ -29,6 +29,7 @@ import html
 import os
 import secrets
 import time
+from collections import defaultdict
 from typing import List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -358,7 +359,7 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
     for lbl in used_labels:  # summary.nodes에 없던 라벨은 안전하게 합성(레이어 0, 메타 없음).
         by_label.setdefault(lbl, {"label": lbl, "namespace": None, "workload": None, "kind": "app", "layer": 0})
 
-    # 열(layer)별로 노드 그룹핑 → 열 안에서는 라벨순 정렬(안정적 배치).
+    # 열(layer)별로 노드 그룹핑 → 우선 라벨순으로 안정 정렬(이후 barycenter로 재정렬).
     columns: dict = {}
     for n in by_label.values():
         columns.setdefault(n["layer"], []).append(n)
@@ -373,25 +374,78 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             return _KIND_LABEL.get(n["kind"], "")
         return ""
 
-    # 열 폭 = 그 열에서 가장 넓은 칩. 열 x = 이전 열들 폭 + 열 간격(간선 공간) 누적.
-    chip_h, row_h, pad_top, pad_x, col_gap = 34, 46, 46, 12, 66
+    # --- 교차(선 겹침) 최소화: barycenter 휴리스틱으로 각 열의 노드 순서를 이웃 열에 맞춰 재정렬.
+    # 각 노드를 인접 열에서 연결된 이웃들의 평균 위치로 옮기면 선이 서로 가로지르는 횟수가 준다.
+    # 아래로(선행자 기준)·위로(후행자 기준) 스윕을 몇 차례 반복한다(작은 그래프라 비용은 무시할 수준).
+    out_adj: dict = defaultdict(list)
+    in_adj: dict = defaultdict(list)
+    for e in edges:
+        if e["src"] != e["dst"]:
+            out_adj[e["src"]].append(e["dst"])
+            in_adj[e["dst"]].append(e["src"])
+
+    def _index() -> dict:
+        return {n["label"]: i for L in columns for i, n in enumerate(columns[L])}
+
+    def _bary(n: dict, adj: dict, idx: dict) -> float:
+        nb = adj[n["label"]]
+        return sum(idx[x] for x in nb) / len(nb) if nb else float(idx[n["label"]])
+
+    for _ in range(4):
+        for L in range(1, max_layer + 1):
+            idx = _index()
+            columns[L].sort(key=lambda n, idx=idx: _bary(n, in_adj, idx))
+        for L in range(max_layer - 1, -1, -1):
+            idx = _index()
+            columns[L].sort(key=lambda n, idx=idx: _bary(n, out_adj, idx))
+
+    # --- 좌표 배치. '넓게 표현해도 된다'는 요구에 맞춰 열 간격·행 간격을 넉넉히 준다.
+    chip_h, row_h, pad_top, pad_x, col_gap = 36, 60, 50, 16, 150
     slot_w = {
         L: max(_chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26)) for n in columns[L])
         for L in columns
     }
-    col_x, acc = {}, pad_x
+    node_cw = {
+        n["label"]: _chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26))
+        for L in columns for n in columns[L]
+    }
+    col_x, acc = {}, float(pad_x)
     for L in range(max_layer + 1):
         col_x[L] = acc
         acc += slot_w.get(L, 90) + col_gap
     width = acc - col_gap + pad_x
+    content_right = width   # self-loop 고리가 더 오른쪽으로 나가면 아래 루프에서 확장
 
-    pos = {}  # label -> (x, y, chip_w) — 왼쪽 위 모서리 + 폭
-    for L in range(max_layer + 1):
-        for i, n in enumerate(columns.get(L, [])):
-            cw = _chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26))
-            pos[n["label"]] = (col_x[L], pad_top + i * row_h, cw)
     rows = max((len(c) for c in columns.values()), default=1)
-    height = pad_top + rows * row_h + 8
+    node_y = {}
+    for L in range(max_layer + 1):
+        cnt = len(columns.get(L, []))
+        offset = (rows - cnt) * row_h / 2.0   # 짧은 열은 세로 가운데 정렬 → 가파른 대각선/겹침 감소
+        for i, n in enumerate(columns[L]):
+            node_y[n["label"]] = pad_top + offset + i * row_h
+    content_bottom = pad_top + rows * row_h   # 노드 영역 하단(역방향 우회선 bow가 더 내려가면 아래서 확장)
+
+    # --- 포트 분산: 한 노드에 여러 간선이 붙을 때 연결 지점을 칩 높이에 고루 나눠, 화살표가
+    # 한 점에 몰려 겹치는 것을 막는다. 각 노드의 나가는/들어오는 간선을 상대편 y로 정렬해
+    # 위→아래 순서대로 포트를 배정하면 선끼리 교차도 줄어든다.
+    out_e: dict = defaultdict(list)
+    in_e: dict = defaultdict(list)
+    for i, e in enumerate(edges):
+        out_e[e["src"]].append(i)
+        in_e[e["dst"]].append(i)
+    for lst in out_e.values():
+        lst.sort(key=lambda i: node_y[edges[i]["dst"]])
+    for lst in in_e.values():
+        lst.sort(key=lambda i: node_y[edges[i]["src"]])
+    src_py, dst_py = {}, {}
+    for lbl, lst in out_e.items():
+        k = len(lst)
+        for j, i in enumerate(lst):
+            src_py[i] = node_y[lbl] + chip_h * (j + 1) / (k + 1)
+    for lbl, lst in in_e.items():
+        k = len(lst)
+        for j, i in enumerate(lst):
+            dst_py[i] = node_y[lbl] + chip_h * (j + 1) / (k + 1)
 
     max_count = max((e["count"] for e in edges), default=1) or 1
     used_verdicts = {e.get("verdict") or "FORWARDED" for e in edges}
@@ -402,26 +456,43 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
     )
 
     edge_svg = []
-    for e in edges:
+    for i, e in enumerate(edges):
         v = e.get("verdict") or "FORWARDED"
         color = _VERDICT_COLOR.get(v, "#4b5563")
-        sx, sy, sw_ = pos[e["src"]]
-        dx, dy, _ = pos[e["dst"]]
-        x1, y1 = sx + sw_, sy + chip_h / 2          # source 칩 오른쪽 가운데
-        x2, y2 = dx - 9, dy + chip_h / 2            # destination 칩 왼쪽(화살표 여백)
-        cx = (x1 + x2) / 2
-        thick = 1.4 + (e["count"] / max_count) * 7.0
+        s_layer = by_label[e["src"]]["layer"]
+        d_layer = by_label[e["dst"]]["layer"]
+        thick = 1.4 + (e["count"] / max_count) * 6.5
         port = f":{e['dst_port']}" if e.get("dst_port") else ""
         tip = f'{e["src"]} → {e["dst"]}{port} · {e["protocol"]} · {e["count"]}건 · {v}'
+        if e["src"] == e["dst"]:
+            # 자기 자신으로의 흐름: 칩 오른쪽에 작은 고리로 그린다(드묾).
+            x = col_x[s_layer] + node_cw[e["src"]]
+            y = src_py[i]
+            content_right = max(content_right, x + 44)  # 고리가 오른쪽으로 잘리지 않게 폭 확장
+            d = f"M{x:.0f},{y:.0f} C{x + 44:.0f},{y - 24:.0f} {x + 44:.0f},{y + 24:.0f} {x:.0f},{y + 3:.0f}"
+        else:
+            sx = col_x[s_layer] + node_cw[e["src"]]
+            sy = src_py[i]
+            ex = col_x[d_layer] - 9
+            ey = dst_py[i]
+            if ex > sx:  # 정방향(왼→오): 수평 중간점을 제어점으로 하는 S커브.
+                cx = (sx + ex) / 2
+                d = f"M{sx:.0f},{sy:.0f} C{cx:.0f},{sy:.0f} {cx:.0f},{ey:.0f} {ex:.0f},{ey:.0f}"
+            else:  # 역방향(순환): 아래로 우회(제어점 x는 두 노드 사이로 유지 → 좌우로 안 삐져나감).
+                bow = max(sy, ey) + row_h * 0.9
+                content_bottom = max(content_bottom, bow)  # 우회선이 뷰박스 밖으로 잘리지 않게 높이 확장
+                d = f"M{sx:.0f},{sy:.0f} C{sx:.0f},{bow:.0f} {ex:.0f},{bow:.0f} {ex:.0f},{ey:.0f}"
         edge_svg.append(
-            f'<path d="M{x1:.0f},{y1:.0f} C{cx:.0f},{y1:.0f} {cx:.0f},{y2:.0f} {x2:.0f},{y2:.0f}" '
-            f'fill="none" stroke="{color}" stroke-width="{thick:.1f}" stroke-opacity="0.7" '
+            f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{thick:.1f}" '
+            f'stroke-opacity="0.75" stroke-linecap="round" '
             f'marker-end="url(#arw-{html.escape(v)})"><title>{html.escape(tip)}</title></path>'
         )
 
     node_svg = []
-    for lbl, (x, y, cw) in pos.items():
-        n = by_label[lbl]
+    for lbl, n in by_label.items():
+        x = col_x[n["layer"]]
+        y = node_y[lbl]
+        cw = node_cw[lbl]
         stroke = _KIND_STROKE.get(n["kind"], "#9ca3af")
         fill = _KIND_FILL.get(n["kind"], "none")
         dash = ' stroke-dasharray="3 2"' if n["kind"] == "reserved" else ""
@@ -429,23 +500,26 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         label_disp = _shorten(lbl, 26)
         url = _flows_url(scope=scope, namespace=namespace, focus=lbl)
         sub_svg = (
-            f'<text x="{x + 9:.0f}" y="{y + 26:.0f}" font-size="9" fill="currentColor" '
+            f'<text x="{x + 10:.0f}" y="{y + 27:.0f}" font-size="9" fill="currentColor" '
             f'opacity="0.6">{html.escape(sub)}</text>' if sub else ""
         )
         node_svg.append(
             f'<a href="{html.escape(url)}"><title>{html.escape(lbl)} 연결만 보기</title>'
-            f'<rect x="{x:.0f}" y="{y:.0f}" width="{cw:.0f}" height="{chip_h}" rx="6" '
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{cw:.0f}" height="{chip_h}" rx="7" '
             f'fill="{fill}" stroke="{stroke}"{dash} stroke-width="1"/>'
-            f'<text x="{x + 9:.0f}" y="{y + 15:.0f}" font-size="11.5" fill="currentColor">'
+            f'<text x="{x + 10:.0f}" y="{y + 16:.0f}" font-size="11.5" fill="currentColor">'
             f'{html.escape(label_disp)}</text>{sub_svg}</a>'
         )
 
+    height = content_bottom + 14
+    width = content_right + 8
+
     caption = (
-        f'<text x="{pad_x}" y="26" font-size="11" fill="currentColor" opacity="0.6">'
+        f'<text x="{pad_x}" y="30" font-size="11" fill="currentColor" opacity="0.6">'
         f'→ 오른쪽으로 갈수록 다음 단계(hop) · 칩=리소스, 아래줄=워크로드</text>'
     )
     return (
-        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height}" width="100%" '
+        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" width="100%" '
         f'style="max-width:{width:.0f}px;height:auto;display:block" role="img" '
         f'aria-label="멀티홉 Pod 트래픽 흐름 그래프">'
         f"<defs>{markers}</defs>{caption}{''.join(edge_svg)}{''.join(node_svg)}</svg></div>"
