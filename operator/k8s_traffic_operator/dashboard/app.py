@@ -597,32 +597,47 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             columns[L].sort(key=lambda n, idx=idx: _bary(n, out_adj, idx))
 
     # --- 좌표 배치(세로 흐름). 계층(hop)을 위→아래로 쌓고, 한 계층의 노드는 가로로 편다.
-    # 주 축을 세로로 두면 깊은 사슬은 '아래로' 길어지고 가로 폭은 컨테이너에 맞아 좌우 스크롤이
-    # 안 생긴다(크기는 그대로 크게 유지). 칩 높이/폰트는 확대값 그대로.
-    chip_h, lay_gap, node_hgap, pad_top, pad_x = 46, 112, 30, 50, 22
+    # 한 계층의 노드가 많아 가로가 컨테이너(TARGET_W)를 넘으면 **여러 줄로 접어** 아래로 쌓는다
+    # → 가로 스크롤 없이 아래로만 길어지고, 축소되지 않아 크기도 유지된다. 칩/폰트는 확대값 그대로.
+    chip_h, lay_gap, node_hgap, intra_gap, pad_top, pad_x = 46, 96, 30, 18, 50, 22
+    TARGET_W = 980.0   # 한 줄 최대 가로 폭(≈컨테이너). 넘으면 다음 줄로 접는다.
     node_cw = {
         n["label"]: _chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26))
         for L in columns for n in columns[L]
     }
-    # 계층별 세로 위치(위→아래).
-    layer_y, acc = {}, float(pad_top)
-    for L in range(max_layer + 1):
-        layer_y[L] = acc
-        acc += chip_h + lay_gap
-    content_bottom = layer_y[max_layer] + chip_h  # 역방향 우회/self-loop이 더 내려가면 아래서 확장
 
-    # 계층별 가로 폭(칩 폭 합 + 간격) → 가장 넓은 계층 기준 전체 폭, 각 계층을 가로 가운데 정렬.
-    layer_w = {
-        L: sum(node_cw[n["label"]] for n in columns[L]) + node_hgap * max(0, len(columns[L]) - 1)
-        for L in columns
-    }
-    content_width = max(layer_w.values(), default=90.0) + 2 * pad_x
-    node_x = {}
+    # 1) 각 계층을 TARGET_W 이내의 여러 '줄'로 접는다(줄바꿈 패킹). 가장 넓은 줄로 전체 폭 결정.
+    layers_rows: dict = {}
+    max_row_w = 90.0
     for L in range(max_layer + 1):
-        x = (content_width - layer_w.get(L, 0.0)) / 2.0   # 가운데 정렬
-        for n in columns[L]:
-            node_x[n["label"]] = x
-            x += node_cw[n["label"]] + node_hgap
+        rows_l, cur, cur_w = [], [], 0.0
+        for n in columns.get(L, []):
+            w = node_cw[n["label"]]
+            add = w if not cur else node_hgap + w
+            if cur and cur_w + add > TARGET_W:
+                rows_l.append((cur, cur_w)); cur, cur_w = [], 0.0
+                add = w
+            cur.append(n); cur_w += add
+        if cur:
+            rows_l.append((cur, cur_w))
+        layers_rows[L] = rows_l or [([], 0.0)]
+        for _r, rw in layers_rows[L]:
+            max_row_w = max(max_row_w, rw)
+    content_width = max_row_w + 2 * pad_x
+
+    # 2) 좌표 배정: 계층을 위→아래로, 계층 안의 여러 줄도 위→아래로. 각 줄은 가운데 정렬.
+    node_x, node_y = {}, {}
+    y = float(pad_top)
+    for L in range(max_layer + 1):
+        for row, rw in layers_rows[L]:
+            x = (content_width - rw) / 2.0
+            for n in row:
+                node_x[n["label"]] = x
+                node_y[n["label"]] = y
+                x += node_cw[n["label"]] + node_hgap
+            y += chip_h + intra_gap        # 같은 계층 다음 줄
+        y += lay_gap - intra_gap           # 다음 계층까지 간격
+    content_bottom = (max(node_y.values()) + chip_h) if node_y else pad_top + chip_h
     content_right = content_width  # 역방향 우회선이 더 오른쪽으로 나가면 아래 루프에서 확장
 
     # --- 포트 분산: 한 노드에 여러 간선이 붙을 때 연결 지점을 칩 '가로 폭'에 고루 나눠 겹침을
@@ -672,20 +687,22 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         port = f":{e['dst_port']}" if e.get("dst_port") else ""
         tip = f'{e["src"]} → {e["dst"]}{port} · {e["protocol"]} · {e["count"]}건 · {v}'
         ARROW_GAP = 11
+        # 계층이 여러 줄로 접힐 수 있으므로 계층 기준이 아니라 노드별 실제 y를 쓴다.
+        sy_top, dy_top = node_y[e["src"]], node_y[e["dst"]]
         if e["src"] == e["dst"]:
             # 자기 자신으로의 흐름: 칩 아래에 작은 고리로 그린다(드묾).
             x = node_x[e["src"]] + node_cw[e["src"]] / 2
-            y = layer_y[s_layer] + chip_h
+            y = sy_top + chip_h
             content_bottom = max(content_bottom, y + 46)  # 고리가 아래로 잘리지 않게 높이 확장
             p0, c1, c2, p3 = (x, y), (x - 28, y + 44), (x + 28, y + 44), (x, y + 3)
-        elif d_layer > s_layer:  # 정방향(위→아래): 세로 중간점을 제어점으로 하는 S커브.
-            sx, sy = src_px[i], layer_y[s_layer] + chip_h        # 출발 = 칩 아래 변
-            ex, ey = dst_px[i], layer_y[d_layer] - ARROW_GAP     # 도착 = 다음 칩 위 변
+        elif dy_top > sy_top:  # 정방향(위→아래): 세로 중간점을 제어점으로 하는 S커브.
+            sx, sy = src_px[i], sy_top + chip_h                  # 출발 = 칩 아래 변
+            ex, ey = dst_px[i], dy_top - ARROW_GAP               # 도착 = 다음 칩 위 변
             cy = (sy + ey) / 2
             p0, c1, c2, p3 = (sx, sy), (sx, cy), (ex, cy), (ex, ey)
-        else:  # 역방향/동일계층(순환): 오른쪽으로 우회(위→아래 흐름을 방해하지 않게).
-            sx, sy = src_px[i], layer_y[s_layer]                 # 출발 = 칩 위 변
-            ex, ey = dst_px[i], layer_y[d_layer] + chip_h + ARROW_GAP  # 도착 = 대상 칩 아래 변
+        else:  # 역방향/동일 높이(순환): 오른쪽으로 우회(위→아래 흐름을 방해하지 않게).
+            sx, sy = src_px[i], sy_top                           # 출발 = 칩 위 변
+            ex, ey = dst_px[i], dy_top + chip_h + ARROW_GAP      # 도착 = 대상 칩 아래 변
             bow = max(sx, ex, content_width - pad_x) + 48
             content_right = max(content_right, bow + 12)         # 우회선이 잘리지 않게 폭 확장
             p0, c1, c2, p3 = (sx, sy), (bow, sy), (bow, ey), (ex, ey)
@@ -710,7 +727,7 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
     node_svg = []
     for lbl, n in by_label.items():
         x = node_x[lbl]
-        y = layer_y[n["layer"]]
+        y = node_y[lbl]
         cw = node_cw[lbl]
         stroke = _KIND_STROKE.get(n["kind"], "#9ca3af")
         fill = _KIND_FILL.get(n["kind"], "none")

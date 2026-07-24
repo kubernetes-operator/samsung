@@ -68,7 +68,7 @@ spec:
         fsGroup: 1001
       containers:
         - name: dashboard
-          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.7
+          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.8
           ports:
             - containerPort: 8080
           volumeMounts:
