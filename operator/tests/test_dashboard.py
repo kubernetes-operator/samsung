@@ -418,6 +418,45 @@ def test_flow_graph_svg_renders_multihop_chain():
     assert "▸ front" in svg and "▸ mid" in svg and "▸ back" in svg
 
 
+def test_flow_graph_edges_uniform_width_and_speed_by_count():
+    """화살표는 두께 균일 + '전기 흐르듯' 애니메이션 주기가 연결 수에 반비례(많을수록 빠름)."""
+    import re
+    nodes = [
+        {"label": "hub", "namespace": "x", "workload": None, "kind": "app", "layer": 0},
+        {"label": "busy", "namespace": "x", "workload": None, "kind": "app", "layer": 1},
+        {"label": "quiet", "namespace": "x", "workload": None, "kind": "app", "layer": 1},
+    ]
+    edges = [
+        {"src": "hub", "dst": "busy", "protocol": "TCP", "dst_port": 80, "count": 100, "verdict": "FORWARDED"},
+        {"src": "hub", "dst": "quiet", "protocol": "TCP", "dst_port": 80, "count": 2, "verdict": "FORWARDED"},
+    ]
+    svg = dashboard_app._flow_graph_svg(nodes, edges)
+    widths = set(re.findall(r'class="flow-edge"[^>]*stroke-width="([\d.]+)"', svg))
+    assert widths == {"2.6"}                         # 모든 화살표 두께 동일(연결 수와 무관)
+    durs = sorted(float(d) for d in re.findall(r"animation-duration:([\d.]+)s", svg))
+    assert len(durs) == 2 and durs[0] < durs[1]      # 연결 많은 쪽이 더 짧은 주기(빠른 흐름)
+    assert abs(durs[0] - 0.5) < 0.01                 # 최다 연결 = 가장 빠름(DUR_FAST)
+    assert abs(durs[1] - 3.0) < 0.01                 # 최소 연결 = 가장 느림(DUR_SLOW)
+
+
+def test_flow_graph_shows_actual_counts():
+    """실제 연결 수가 화살표에 숫자 텍스트로 표기된다."""
+    nodes = [{"label": "a", "namespace": "x", "workload": None, "kind": "app", "layer": 0}]
+    edges = [{"src": "a", "dst": "b", "protocol": "TCP", "dst_port": 80, "count": 42, "verdict": "FORWARDED"}]
+    svg = dashboard_app._flow_graph_svg(nodes, edges)
+    assert ">42</text>" in svg
+
+
+def test_flows_page_includes_flow_animation_css(monkeypatch):
+    """페이지에 흐름 애니메이션 CSS와 '전기' 설명이 포함된다(모션 최소화 대응 포함)."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    text = _authed_client().get("/").text
+    assert "@keyframes flow-dash" in text
+    assert "prefers-reduced-motion" in text
+    assert "전기" in text
+
+
 def test_flow_graph_svg_spreads_edge_ports_to_avoid_overlap():
     """한 노드에서 나가는 여러 간선이 한 점에 몰리지 않고 서로 다른 y에서 출발해야 한다.
 

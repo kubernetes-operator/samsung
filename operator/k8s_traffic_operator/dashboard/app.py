@@ -158,6 +158,15 @@ _STYLE = """
   .diagram { overflow-x: auto; border: 1px solid var(--border); background: var(--card-bg);
              border-radius: 10px; padding: .5rem .75rem; margin-bottom: .25rem; }
   .diagram-cap { color: var(--muted); font-size: .78rem; margin: 0 0 1.25rem; }
+  /* 화살표를 '전기가 흐르듯' 표현: 두께는 균일, 이동하는 파선(dash)이 목적지 쪽으로 흐른다.
+     흐름 속도(주기)는 연결 수에 반비례해 각 선의 인라인 animation-duration으로 지정한다
+     (연결 잦을수록 빠름). 모션 최소화 선호 시 애니메이션을 끄고 실선으로 둔다(숫자는 그대로). */
+  @keyframes flow-dash { to { stroke-dashoffset: -14; } }
+  .flow-edge { stroke-dasharray: 6 8; animation-name: flow-dash;
+               animation-timing-function: linear; animation-iteration-count: infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .flow-edge { animation: none; stroke-dasharray: none; }
+  }
 """
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -330,8 +339,10 @@ def _flows_help_html() -> str:
         '<div class="help">'
         "<p><strong>이 페이지는 무엇인가요?</strong> Cilium(CNI)의 <strong>Hubble</strong>이 관측한 "
         "<em>실제 Pod 간 네트워크 연결</em>입니다(L3/L4 수준). 아래 다이어그램에서 "
-        "<strong>화살표</strong>는 연결 방향(source → destination), <strong>선 굵기</strong>는 "
-        "관측된 연결 수, <strong>색</strong>은 Cilium의 정책 <strong>판정(verdict)</strong>입니다.</p>"
+        "<strong>화살표</strong>는 연결 방향(source → destination)이며 <strong>전기가 흐르듯</strong> "
+        "애니메이션됩니다 — 연결이 잦은 경로일수록 <strong>더 빠르게</strong> 흐릅니다(두께는 모두 동일). "
+        "화살표 가운데 <strong>숫자</strong>가 실제 관측된 연결 수이고, <strong>색</strong>은 "
+        "Cilium의 정책 <strong>판정(verdict)</strong>입니다.</p>"
         "<p>다이어그램은 <strong>멀티홉 흐름 그래프</strong>입니다 — 각 리소스를 한 번만 그리고 "
         "<strong>왼쪽에서 오른쪽으로 갈수록 다음 단계(hop)</strong>로 이어집니다. 그래서 "
         "<code>A→B</code>와 <code>B→C</code>가 같이 관측되면 <code>A→B→C</code> 사슬로 연결돼 "
@@ -475,6 +486,8 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             dst_py[i] = node_y[lbl] + chip_h * (j + 1) / (k + 1)
 
     max_count = max((e["count"] for e in edges), default=1) or 1
+    min_count = min((e["count"] for e in edges), default=1)
+    span = (max_count - min_count) or 1
     used_verdicts = {e.get("verdict") or "FORWARDED" for e in edges}
     markers = "".join(
         f'<marker id="arw-{html.escape(v)}" markerWidth="8" markerHeight="8" refX="6.5" refY="3" '
@@ -482,13 +495,19 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         for v in used_verdicts
     )
 
+    EDGE_W = 2.6                    # 모든 화살표 두께 균일(연결 수와 무관)
+    DUR_FAST, DUR_SLOW = 0.5, 3.0   # 흐름 애니메이션 주기(초): 연결 많음=빠름(짧은 주기)
+
+    def _cubic_mid(p0, c1, c2, p3):  # 3차 베지어 t=0.5 지점(연결 수 라벨 위치)
+        return (0.125 * p0[0] + 0.375 * c1[0] + 0.375 * c2[0] + 0.125 * p3[0],
+                0.125 * p0[1] + 0.375 * c1[1] + 0.375 * c2[1] + 0.125 * p3[1])
+
     edge_svg = []
     for i, e in enumerate(edges):
         v = e.get("verdict") or "FORWARDED"
         color = _VERDICT_COLOR.get(v, "#4b5563")
         s_layer = by_label[e["src"]]["layer"]
         d_layer = by_label[e["dst"]]["layer"]
-        thick = 1.4 + (e["count"] / max_count) * 6.5
         port = f":{e['dst_port']}" if e.get("dst_port") else ""
         tip = f'{e["src"]} → {e["dst"]}{port} · {e["protocol"]} · {e["count"]}건 · {v}'
         if e["src"] == e["dst"]:
@@ -496,7 +515,7 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             x = col_x[s_layer] + node_cw[e["src"]]
             y = src_py[i]
             content_right = max(content_right, x + 44)  # 고리가 오른쪽으로 잘리지 않게 폭 확장
-            d = f"M{x:.0f},{y:.0f} C{x + 44:.0f},{y - 24:.0f} {x + 44:.0f},{y + 24:.0f} {x:.0f},{y + 3:.0f}"
+            p0, c1, c2, p3 = (x, y), (x + 44, y - 24), (x + 44, y + 24), (x, y + 3)
         else:
             sx = col_x[s_layer] + node_cw[e["src"]]
             sy = src_py[i]
@@ -504,15 +523,27 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             ey = dst_py[i]
             if ex > sx:  # 정방향(왼→오): 수평 중간점을 제어점으로 하는 S커브.
                 cx = (sx + ex) / 2
-                d = f"M{sx:.0f},{sy:.0f} C{cx:.0f},{sy:.0f} {cx:.0f},{ey:.0f} {ex:.0f},{ey:.0f}"
+                p0, c1, c2, p3 = (sx, sy), (cx, sy), (cx, ey), (ex, ey)
             else:  # 역방향(순환): 아래로 우회(제어점 x는 두 노드 사이로 유지 → 좌우로 안 삐져나감).
                 bow = max(sy, ey) + row_h * 0.9
                 content_bottom = max(content_bottom, bow)  # 우회선이 뷰박스 밖으로 잘리지 않게 높이 확장
-                d = f"M{sx:.0f},{sy:.0f} C{sx:.0f},{bow:.0f} {ex:.0f},{bow:.0f} {ex:.0f},{ey:.0f}"
+                p0, c1, c2, p3 = (sx, sy), (sx, bow), (ex, bow), (ex, ey)
+        d = (f"M{p0[0]:.0f},{p0[1]:.0f} C{c1[0]:.0f},{c1[1]:.0f} "
+             f"{c2[0]:.0f},{c2[1]:.0f} {p3[0]:.0f},{p3[1]:.0f}")
+        # 연결 많을수록 흐름 주기를 짧게(=빠르게). 상대 빈도(min~max) 기준. d를 attr 맨 앞에 둔다.
+        ratio = (e["count"] - min_count) / span
+        dur = DUR_SLOW - ratio * (DUR_SLOW - DUR_FAST)
         edge_svg.append(
-            f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{thick:.1f}" '
-            f'stroke-opacity="0.75" stroke-linecap="round" '
+            f'<path d="{d}" class="flow-edge" fill="none" stroke="{color}" stroke-width="{EDGE_W}" '
+            f'stroke-opacity="0.85" stroke-linecap="round" style="animation-duration:{dur:.2f}s" '
             f'marker-end="url(#arw-{html.escape(v)})"><title>{html.escape(tip)}</title></path>'
+        )
+        # 실제 연결 수를 화살표 가운데에 표기(배경색 halo로 선 위에서도 읽히게). 정적(애니메이션 없음).
+        mx, my = _cubic_mid(p0, c1, c2, p3)
+        edge_svg.append(
+            f'<text x="{mx:.0f}" y="{my - 3:.0f}" text-anchor="middle" font-size="10" '
+            f'font-weight="700" fill="{color}" '
+            f'style="paint-order:stroke;stroke:var(--card-bg);stroke-width:3px">{e["count"]}</text>'
         )
 
     node_svg = []
@@ -658,8 +689,9 @@ def _render_flows(summary: FlowSummary) -> str:
         shown_in_diagram = min(10, len(summary.top_pairs))
         diagram_cap = (
             f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결을 멀티홉 그래프로 도식화 '
-            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 왼→오 = 다음 단계(hop), "
-            "선 위에 마우스를 올리면 프로토콜·포트·건수, 칩을 클릭하면 그 리소스 연결만 보기.</p>"
+            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 왼→오 = 다음 단계(hop) · "
+            "화살표는 전기 흐르듯 애니메이션(연결 잦을수록 빠름), 가운데 숫자 = 실제 연결 수 · "
+            "선 위 마우스 = 상세, 칩 클릭 = 그 리소스 연결만 보기.</p>"
         )
         rows = "\n".join(
             _flow_pair_row_html(p, scope=summary.scope, namespace=summary.namespace)
