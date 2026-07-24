@@ -287,9 +287,9 @@ def test_menu_bar_present_on_both_pages(monkeypatch):
     client = _authed_client()
     for path in ("/", "/policies"):
         text = client.get(path).text
-        assert 'class="topbar"' in text                 # 메뉴바 컨테이너
-        assert 'href="/" class="active"' in text or 'href="/"' in text  # 트래픽 흐름(메인)
-        assert 'href="/policies"' in text               # 정책 현황
+        assert 'class="topbar"' in text                 # seoul 스타일 상단바 컨테이너
+        assert 'class="home-link"' in text              # 제목=홈 링크
+        assert 'href="/"' in text and 'href="/policies"' in text
         assert "트래픽 흐름" in text and "정책 현황" in text
 
 
@@ -301,9 +301,9 @@ def test_main_page_is_traffic_flows(monkeypatch):
     )
     text = _authed_client().get("/").text
     assert "Hubble" in text                       # 흐름 페이지 설명 패널
-    assert 'class="menu"' in text
-    # 메뉴바의 '트래픽 흐름' 탭이 활성 표시.
-    assert 'href="/" class="active"' in text
+    assert 'class="tabs"' in text
+    # '트래픽 흐름' 탭이 활성(seoul .tab.active 스타일).
+    assert 'href="/" class="tab active"' in text
 
 
 def test_flows_alias_still_works(monkeypatch):

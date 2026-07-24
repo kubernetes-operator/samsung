@@ -108,45 +108,56 @@ _PHASE_COLOR = {
 }
 _VERDICT_COLOR = {"FORWARDED": "#15803d", "DROPPED": "#b91c1c", "ERROR": "#b91c1c", "AUDIT": "#b45309"}
 
+# 디자인은 seoul(k8s-cluster-tester) 대시보드의 기본 페이지와 통일한다: CSS 변수 기반 라이트/다크
+# 테마, border-bottom 형태의 상단바(브랜드 + 탭), 가운데 정렬 main(max-width 1100px),
+# findings-table 스타일 표. 색/간격 값은 seoul frontend/static/css/style.css 기준.
 _STYLE = """
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 2rem;
-         background: #0b0d12; color: #e5e7eb; }
-  @media (prefers-color-scheme: light) { body { background: #f8fafc; color: #111827; } }
-  h1 { font-size: 1.25rem; margin-bottom: .25rem; }
-  a { color: #60a5fa; }
-  a.active { color: inherit; font-weight: 600; text-decoration: underline; }
-  /* 상단 메뉴바: 브랜드(좌) + 탭 메뉴. sticky로 스크롤해도 상단에 고정. */
-  .topbar { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1.25rem;
-            padding: .55rem .9rem; margin-bottom: 1.25rem; border-radius: .6rem;
-            background: rgba(148,163,184,.12); border: 1px solid rgba(148,163,184,.22);
-            position: sticky; top: .5rem; z-index: 10; backdrop-filter: blur(6px); }
-  .topbar .brand { font-weight: 700; font-size: .95rem; margin-right: auto; }
-  .menu { display: flex; gap: .35rem; }
-  .menu a { color: #9ca3af; text-decoration: none; padding: .35rem .8rem; border-radius: .45rem;
-            font-size: .9rem; white-space: nowrap; }
-  .menu a:hover { background: rgba(148,163,184,.16); color: inherit; }
-  .menu a.active { background: #2563eb; color: #fff; font-weight: 600; text-decoration: none; }
-  .meta { color: #9ca3af; font-size: .85rem; margin-bottom: 1.5rem; }
-  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-  th { text-align: left; padding: .5rem .75rem; border-bottom: 2px solid #374151; color: #9ca3af;
-        font-weight: 600; text-transform: uppercase; font-size: .75rem; }
-  td { padding: .6rem .75rem; border-bottom: 1px solid #1f2937; vertical-align: top; }
-  @media (prefers-color-scheme: light) {
-    th { border-bottom-color: #e5e7eb; } td { border-bottom-color: #f1f5f9; }
+  :root {
+    color-scheme: light dark;
+    --bg:#ffffff; --fg:#1a1a1a; --muted:#6b7280; --border:#e2e2e2; --card-bg:#f7f7f8;
+    --critical:#dc2626; --warning:#d97706; --info:#2563eb; --primary:#111827; --primary-fg:#ffffff;
   }
-  .sub { color: #9ca3af; font-size: .78rem; margin-top: .15rem; }
-  .badge { display: inline-block; padding: .15rem .5rem; border-radius: .35rem; color: white;
-            font-size: .78rem; font-weight: 600; }
-  .error-row td { color: #b91c1c; }
-  .empty { color: #9ca3af; padding: 2rem 0; text-align: center; }
-  code { font-size: .82em; background: rgba(148,163,184,.18); padding: 0 .3rem; border-radius: .25rem; }
-  .help { border: 1px solid rgba(148,163,184,.28); border-radius: .5rem;
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#121212; --fg:#e5e5e5; --muted:#9ca3af; --border:#2e2e2e; --card-bg:#1c1c1e;
+      --critical:#f87171; --warning:#fbbf24; --info:#60a5fa; --primary:#e5e5e5; --primary-fg:#121212;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  a { color: var(--info); }
+  /* 상단바: 브랜드(제목=홈 링크) + 탭 내비게이션. seoul .topbar와 동일한 border-bottom 형태. */
+  .topbar { display: flex; align-items: center; gap: 24px; padding: 12px 20px;
+            border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .topbar h1 { font-size: 18px; margin: 0; }
+  .home-link { font: inherit; color: inherit; font-weight: 600; text-decoration: none; }
+  .home-link:hover { text-decoration: underline; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tab { background: none; border: 1px solid transparent; color: var(--muted);
+         padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 14px; text-decoration: none; }
+  .tab:hover { color: var(--fg); }
+  .tab.active { background: var(--card-bg); color: var(--fg); border-color: var(--border); }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  h2.page-title { font-size: 18px; margin: 0 0 4px; }
+  a.active { color: inherit; font-weight: 600; text-decoration: underline; }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .sub { color: var(--muted); font-size: .78rem; margin-top: .15rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; color: #fff;
+            font-size: 11px; font-weight: 600; }
+  .error-row td { color: var(--critical); }
+  .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
+  code { background: var(--card-bg); padding: 1px 5px; border-radius: 4px; font-size: .85em; }
+  .help { border: 1px solid var(--border); background: var(--card-bg); border-radius: 10px;
           padding: .75rem 1rem; margin-bottom: 1rem; font-size: .9rem; line-height: 1.5; }
   .help p { margin: .3rem 0; }
-  .diagram { overflow-x: auto; border: 1px solid rgba(148,163,184,.28); border-radius: .5rem;
-             padding: .5rem .75rem; margin-bottom: .25rem; }
-  .diagram-cap { color: #9ca3af; font-size: .78rem; margin: 0 0 1.25rem; }
+  .diagram { overflow-x: auto; border: 1px solid var(--border); background: var(--card-bg);
+             border-radius: 10px; padding: .5rem .75rem; margin-bottom: .25rem; }
+  .diagram-cap { color: var(--muted); font-size: .78rem; margin: 0 0 1.25rem; }
 """
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -160,15 +171,17 @@ _PAGE_TEMPLATE = """<!doctype html>
 </head>
 <body>
 <header class="topbar">
-  <span class="brand">TrafficPolicy 대시보드</span>
-  <nav class="menu">
-    <a href="{prefix}/" class="{nav_flows}">🌐 트래픽 흐름</a>
-    <a href="{prefix}/policies" class="{nav_policies}">📋 정책 현황</a>
+  <h1><a href="{prefix}/" class="home-link">TrafficPolicy 대시보드</a></h1>
+  <nav class="tabs">
+    <a href="{prefix}/" class="tab {nav_flows}">트래픽 흐름</a>
+    <a href="{prefix}/policies" class="tab {nav_policies}">정책 현황</a>
   </nav>
 </header>
-<h1>{heading}</h1>
-<div class="meta">{meta}</div>
-{table}
+<main>
+  <h2 class="page-title">{heading}</h2>
+  <div class="meta">{meta}</div>
+  {table}
+</main>
 </body>
 </html>"""
 
@@ -270,7 +283,7 @@ def _render_policies(policies: List[PolicySummary]) -> str:
 <tbody>{rows}</tbody>
 </table>"""
     return _page(
-        active="policies", title="TrafficPolicy Dashboard", heading="TrafficPolicy Dashboard",
+        active="policies", title="TrafficPolicy Dashboard", heading="정책 현황",
         meta=f"트래픽 기반 자동운영 오퍼레이터 · 읽기 전용 · 10초마다 새로고침 · {len(policies)}개 정책",
         table=table,
     )
