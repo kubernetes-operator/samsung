@@ -293,12 +293,14 @@ def test_menu_bar_present_on_both_pages(monkeypatch):
         assert "트래픽 흐름" in text and "정책 현황" in text
 
 
-def test_brand_title_is_blue(monkeypatch):
-    """상단 'TrafficPolicy 대시보드' 브랜드 제목은 앱 강조색(파란색 --info)이어야 한다."""
+def test_brand_title_is_blue_and_bold(monkeypatch):
+    """상단 'TrafficPolicy 대시보드' 브랜드 제목은 앱 강조색(파란 --info) + 굵게여야 한다."""
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
                         lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
     text = _authed_client().get("/").text
-    assert "color: var(--info)" in text.split(".home-link")[1].split("}")[0]
+    rule = text.split(".home-link")[1].split("}")[0]
+    assert "color: var(--info)" in rule
+    assert "font-weight: 800" in rule
 
 
 def test_main_page_is_traffic_flows(monkeypatch):
