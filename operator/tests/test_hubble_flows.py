@@ -171,3 +171,79 @@ def test_fetch_summary_passes_scope_through(monkeypatch):
     allf = hf.fetch_summary(scope="all")
     assert app.shown == 1
     assert allf.shown == 2
+
+
+# --------------------------------------------------------------------------- namespace 필터
+def test_summarize_lists_namespaces_present_in_scope():
+    """scope 적용 후 등장하는 네임스페이스 목록이 흐름 수 내림차순으로 채워져야 한다(필터 UI용)."""
+    events = [
+        _ev(src_ns="shop", dst_ns="shop"),      # {shop} → shop +1
+        _ev(src_ns="shop", dst_ns="pay"),       # {shop,pay} → shop +1, pay +1
+        _ev(src_ns="pay", dst_ns="pay"),        # {pay} → pay +1
+    ]                                           # 결과: shop 2, pay 2 (동수)
+    summary = hf.summarize(events)
+    names = [n["name"] for n in summary.namespaces]
+    counts = {n["name"]: n["count"] for n in summary.namespaces}
+    assert names == ["pay", "shop"]  # 흐름 수 내림차순, 동수면 이름 오름차순
+    assert counts == {"shop": 2, "pay": 2}
+
+
+def test_summarize_namespace_filter_keeps_flows_touching_that_namespace():
+    events = [
+        _ev(src_ns="shop", dst_ns="shop"),
+        _ev(src_ns="shop", dst_ns="pay"),   # shop이 한쪽 → shop 필터에 포함
+        _ev(src_ns="pay", dst_ns="pay"),    # shop 없음 → 제외
+    ]
+    summary = hf.summarize(events, namespace="shop")
+    assert summary.namespace == "shop"
+    assert summary.shown == 2
+    assert all("pay/" not in p["src"] or "shop" in (p["src"] + p["dst"]) for p in summary.top_pairs)
+    # namespaces 목록은 필터와 무관하게 scope 기준 전체를 계속 제공한다.
+    assert {n["name"] for n in summary.namespaces} == {"shop", "pay"}
+
+
+# --------------------------------------------------------------------------- focus(연결된 리소스) 필터
+def test_summarize_focus_keeps_only_flows_touching_that_resource():
+    events = [
+        _ev(src_pod="checkout-abc", src_ns="shop", dst_pod="cart-def", dst_ns="shop"),
+        _ev(src_pod="checkout-abc", src_ns="shop", dst_pod="pay-xyz", dst_ns="shop"),
+        _ev(src_pod="web-1", src_ns="shop", dst_pod="cart-def", dst_ns="shop"),  # checkout 무관
+    ]
+    summary = hf.summarize(events, focus="shop/checkout-abc")
+    assert summary.focus == "shop/checkout-abc"
+    assert summary.shown == 2
+    for p in summary.top_pairs:
+        assert "shop/checkout-abc" in (p["src"], p["dst"])
+
+
+def test_summarize_namespace_and_focus_combine():
+    events = [
+        _ev(src_pod="checkout-abc", src_ns="shop", dst_pod="cart-def", dst_ns="shop"),
+        _ev(src_pod="checkout-abc", src_ns="shop", dst_pod="db-1", dst_ns="data"),  # ns=shop∪data
+        _ev(src_pod="worker", src_ns="data", dst_pod="db-1", dst_ns="data"),        # checkout 무관
+    ]
+    # data 네임스페이스에 걸치면서 checkout이 낀 흐름만
+    summary = hf.summarize(events, namespace="data", focus="shop/checkout-abc")
+    assert summary.shown == 1
+    assert summary.top_pairs[0]["dst"] == "data/db-1"
+
+
+def test_fetch_summary_passes_namespace_and_focus_through(monkeypatch):
+    lines = "\n".join([
+        _flow_line(src_pod="checkout-abc", src_ns="shop", dst_pod="cart-def", dst_ns="shop"),
+        _flow_line(src_pod="web-1", src_ns="shop", dst_pod="cart-def", dst_ns="shop"),
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _fake_completed(lines))
+    summary = hf.fetch_summary(namespace="shop", focus="shop/checkout-abc")
+    assert summary.namespace == "shop"
+    assert summary.focus == "shop/checkout-abc"
+    assert summary.shown == 1
+
+
+def test_fetch_summary_fetch_error_preserves_filters(monkeypatch):
+    def boom(*a, **kw):
+        raise FileNotFoundError()
+    monkeypatch.setattr(subprocess, "run", boom)
+    summary = hf.fetch_summary(scope="all", namespace="shop", focus="shop/x")
+    assert summary.fetch_error is not None
+    assert (summary.scope, summary.namespace, summary.focus) == ("all", "shop", "shop/x")

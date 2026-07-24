@@ -50,11 +50,15 @@ SYSTEM_NAMESPACES = {
 @dataclass
 class FlowSummary:
     total: int = 0                 # 조회된 전체 흐름 수(분류 무관)
-    shown: int = 0                 # 현재 scope로 필터링된 뒤 집계에 쓰인 흐름 수
+    shown: int = 0                 # 모든 필터(scope+namespace+focus) 적용 후 집계에 쓰인 흐름 수
     scope: str = "app"             # "app"(애플리케이션만) | "all"(전체)
     app_flows: int = 0             # 애플리케이션으로 분류된 흐름 수(scope 무관, 참고용)
+    namespace: Optional[str] = None  # 활성 네임스페이스 필터(없으면 전체)
+    focus: Optional[str] = None      # 활성 '연결 리소스' 포커스(endpoint 라벨). 이 리소스가 낀 흐름만
+    # scope 적용 후(namespace/focus 적용 전) 등장하는 네임스페이스 목록 — 필터 UI용.
+    namespaces: List[dict] = field(default_factory=list)  # [{name, count}]
     verdicts: Dict[str, int] = field(default_factory=dict)
-    top_pairs: List[dict] = field(default_factory=list)  # [{src, dst, count, last_seen}]
+    top_pairs: List[dict] = field(default_factory=list)  # [{src, dst, count, last_seen, verdict}]
     fetch_error: Optional[str] = None
 
 
@@ -75,17 +79,62 @@ def is_application_flow(ev: FlowEvent) -> bool:
     return not (_is_system_endpoint(ev.src) and _is_system_endpoint(ev.dst))
 
 
-def summarize(flows: List[FlowEvent], top_n: int = 15, scope: str = "app") -> FlowSummary:
+def _flow_namespaces(ev: FlowEvent) -> set:
+    """이 흐름이 걸치는 (reserved가 아닌) 네임스페이스 집합. 필터 UI 목록 산출에 쓴다."""
+    return {ep.namespace for ep in (ev.src, ev.dst) if ep.namespace}
+
+
+def _flow_in_namespace(ev: FlowEvent, namespace: str) -> bool:
+    """한쪽 endpoint라도 해당 네임스페이스면 포함(is_application_flow와 같은 '한쪽이라도' 관점).
+
+    네임스페이스 A를 선택하면 "A 안팎으로 오가는 모든 흐름"을 보여준다 — A→B, B→A 모두.
+    """
+    return ev.src.namespace == namespace or ev.dst.namespace == namespace
+
+
+def _flow_touches(ev: FlowEvent, label: str) -> bool:
+    """특정 리소스(endpoint 라벨)가 이 흐름의 한쪽 끝인가 — '연결된 리소스만 보기'용."""
+    return ev.src.label == label or ev.dst.label == label
+
+
+def summarize(
+    flows: List[FlowEvent],
+    top_n: int = 15,
+    scope: str = "app",
+    namespace: Optional[str] = None,
+    focus: Optional[str] = None,
+) -> FlowSummary:
     """flow 목록을 (src,dst) 쌍별 집계 + verdict 집계로 요약한다.
 
-    scope="app"(기본)이면 애플리케이션 흐름만 집계 대상으로 삼는다. scope="all"이면 전체.
+    필터는 3단계로 순차 적용된다:
+      1) scope="app"(기본)이면 애플리케이션 흐름만 남긴다. scope="all"이면 전체.
+      2) namespace가 주어지면 그 네임스페이스가 한쪽이라도 낀 흐름만 남긴다.
+      3) focus(endpoint 라벨)가 주어지면 그 리소스가 한쪽 끝인 흐름만 남긴다("연결된 리소스").
+
     total/app_flows는 scope와 무관하게 원본 기준으로 항상 채워, 사용자가 "전체 중 앱이 몇 건"
-    인지 알 수 있게 한다.
+    인지 알 수 있게 한다. namespaces 목록은 scope만 적용한 뒤(namespace/focus 적용 전) 기준으로
+    산출해, 어떤 필터가 걸려 있든 필터 UI에서 다른 네임스페이스로 자유롭게 전환할 수 있게 한다.
     """
     total = len(flows)
     app_flows = sum(1 for ev in flows if is_application_flow(ev))
 
-    selected = flows if scope == "all" else [ev for ev in flows if is_application_flow(ev)]
+    scoped = flows if scope == "all" else [ev for ev in flows if is_application_flow(ev)]
+
+    # 필터 UI가 보여줄 네임스페이스 목록(scope 적용 후, namespace/focus 적용 전) — 흐름 수 내림차순.
+    ns_counter: Counter = Counter()
+    for ev in scoped:
+        for ns in _flow_namespaces(ev):
+            ns_counter[ns] += 1
+    namespaces = [
+        {"name": name, "count": count}
+        for name, count in sorted(ns_counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+    selected = scoped
+    if namespace:
+        selected = [ev for ev in selected if _flow_in_namespace(ev, namespace)]
+    if focus:
+        selected = [ev for ev in selected if _flow_touches(ev, focus)]
 
     verdicts: Counter = Counter()
     pair_counts: Counter = Counter()
@@ -115,15 +164,23 @@ def summarize(flows: List[FlowEvent], top_n: int = 15, scope: str = "app") -> Fl
         shown=len(selected),
         scope=scope,
         app_flows=app_flows,
+        namespace=namespace,
+        focus=focus,
+        namespaces=namespaces,
         verdicts=dict(verdicts),
         top_pairs=top_pairs,
     )
 
 
-def fetch_summary(last: int = HUBBLE_LAST, scope: str = "app") -> FlowSummary:
+def fetch_summary(
+    last: int = HUBBLE_LAST,
+    scope: str = "app",
+    namespace: Optional[str] = None,
+    focus: Optional[str] = None,
+) -> FlowSummary:
     """대시보드가 호출하는 진입점. 실패 시 예외 대신 fetch_error가 채워진 FlowSummary를 반환한다."""
     try:
         flows = fetch_flows(last)
     except HubbleUnavailableError as exc:
-        return FlowSummary(scope=scope, fetch_error=str(exc))
-    return summarize(flows, scope=scope)
+        return FlowSummary(scope=scope, namespace=namespace, focus=focus, fetch_error=str(exc))
+    return summarize(flows, scope=scope, namespace=namespace, focus=focus)

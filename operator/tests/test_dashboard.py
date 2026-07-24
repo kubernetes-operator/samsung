@@ -365,6 +365,106 @@ def test_flow_diagram_svg_limits_to_top_n():
     assert "ns/src-10" not in svg
 
 
+# --------------------------------------------------------------------------- namespace 필터 + focus(연결 리소스)
+def _flows_summary(**kw) -> FlowSummary:
+    base = dict(total=3, shown=3, app_flows=3, verdicts={"FORWARDED": 3}, top_pairs=[{
+        "src": "shop/checkout-abc", "dst": "shop/cart-def", "protocol": "TCP",
+        "dst_port": 8080, "count": 3, "verdict": "FORWARDED",
+        "last_seen": "2026-07-19T12:00:00.000000000Z",
+    }])
+    base.update(kw)
+    return FlowSummary(**base)
+
+
+def test_flows_page_shows_namespace_filter_links(monkeypatch):
+    """네임스페이스 목록이 선택 링크로 렌더되고, 각 링크는 scope를 유지한 /flows URL이어야 한다."""
+    summary = _flows_summary(namespaces=[{"name": "shop", "count": 5}, {"name": "pay", "count": 2}])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert "네임스페이스:" in text
+    assert 'href="/flows?scope=app&amp;namespace=shop"' in text
+    assert 'href="/flows?scope=app&amp;namespace=pay"' in text
+    assert ">shop</a>" in text and "(5)" in text
+
+
+def test_flows_page_marks_active_namespace(monkeypatch):
+    summary = _flows_summary(namespace="shop", namespaces=[{"name": "shop", "count": 5}])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert 'class="active">shop</a>' in text
+
+
+def test_flows_source_destination_are_focus_links(monkeypatch):
+    """표의 Source·Destination은 그 리소스에 focus를 거는 링크여야 한다(라벨의 / 는 %2F로 인코딩)."""
+    summary = _flows_summary()
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert "focus=shop%2Fcheckout-abc" in text
+    assert "focus=shop%2Fcart-def" in text
+
+
+def test_flows_focus_banner_and_clear_link(monkeypatch):
+    """focus가 걸리면 배너 + 해제 링크(focus 없는 URL)를 보여준다."""
+    summary = _flows_summary(focus="shop/checkout-abc", namespace="shop")
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert "shop/checkout-abc" in text
+    assert "선택 해제" in text
+    # 해제 링크는 scope/namespace는 유지하되 focus는 빠진다.
+    assert 'href="/flows?scope=app&amp;namespace=shop"' in text
+
+
+def test_flows_scope_toggle_preserves_namespace_and_focus(monkeypatch):
+    summary = _flows_summary(namespace="shop", focus="shop/checkout-abc",
+                             namespaces=[{"name": "shop", "count": 5}])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    # scope=all 토글 링크가 현재 namespace/focus를 그대로 실어야 한다.
+    assert "scope=all" in text and "namespace=shop" in text and "focus=shop%2Fcheckout-abc" in text
+
+
+def test_flows_empty_with_filter_hints_to_relax(monkeypatch):
+    """필터 때문에 0건이면, '앱 흐름 없음'이 아니라 '필터 완화' 안내를 보여준다."""
+    monkeypatch.setattr(
+        dashboard_app.hubble_flows, "fetch_summary",
+        lambda **kw: FlowSummary(total=10, shown=0, scope="app", namespace="shop"),
+    )
+    text = _authed_client().get("/flows").text
+    assert "필터" in text
+
+
+def test_flows_route_passes_namespace_and_focus_to_fetch(monkeypatch):
+    captured = {}
+
+    def fake(**kw):
+        captured.update(kw)
+        return FlowSummary(total=0)
+
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", fake)
+    _authed_client().get("/flows?scope=all&namespace=shop&focus=shop/checkout-abc")
+    assert captured == {"scope": "all", "namespace": "shop", "focus": "shop/checkout-abc"}
+
+
+def test_flows_route_blank_filters_become_none(monkeypatch):
+    """빈/공백 파라미터는 None으로 정규화해 '필터 없음'과 같게 취급한다."""
+    captured = {}
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: captured.update(kw) or FlowSummary(total=0))
+    _authed_client().get("/flows?namespace=&focus=%20%20")
+    assert captured["namespace"] is None
+    assert captured["focus"] is None
+
+
+def test_api_flows_includes_namespace_focus_and_namespaces(monkeypatch):
+    summary = _flows_summary(namespace="shop", focus="shop/checkout-abc",
+                             namespaces=[{"name": "shop", "count": 5}])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    payload = _authed_client().get("/api/flows").json()
+    assert payload["namespace"] == "shop"
+    assert payload["focus"] == "shop/checkout-abc"
+    assert payload["namespaces"] == [{"name": "shop", "count": 5}]
+
+
 # --------------------------------------------------------------------------- HTTP Basic 인증
 def test_healthz_is_public_without_credentials():
     """프로브 경로 /healthz는 자격증명 없이도 200이어야 한다(k8s liveness/readiness)."""

@@ -30,6 +30,7 @@ import os
 import secrets
 import time
 from typing import List, Optional, Tuple
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -172,6 +173,29 @@ def _url_prefix() -> str:
     return raw
 
 
+def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+    """/flows 링크를 프리픽스 + 현재 필터(scope/namespace/focus)를 담은 URL로 만든다.
+
+    필터끼리 서로를 지우지 않고 조합되도록, 각 UI 요소가 유지할 값만 넘겨 호출한다
+    (예: 네임스페이스 링크는 focus를 안 넘겨 초기화, 리소스 클릭은 namespace를 유지).
+    값은 urlencode로 이스케이프되며, 라벨의 '/'(ns/pod)도 %2F로 안전하게 인코딩된다.
+    """
+    query = {"scope": scope}
+    if namespace:
+        query["namespace"] = namespace
+    if focus:
+        query["focus"] = focus
+    return f"{_url_prefix()}/flows?{urlencode(query)}"
+
+
+def _clean_param(value: Optional[str], max_len: int = 512) -> Optional[str]:
+    """쿼리 파라미터를 다듬는다: 공백 제거, 빈 값은 None, 과도한 길이는 잘라 남용 방지."""
+    if value is None:
+        return None
+    value = value.strip()[:max_len]
+    return value or None
+
+
 def _page(*, active: str, title: str, heading: str, meta: str, table: str) -> str:
     return _PAGE_TEMPLATE.format(
         title=title, style=_STYLE, heading=heading, meta=meta, table=table,
@@ -238,15 +262,19 @@ def _render_policies(policies: List[PolicySummary]) -> str:
 
 
 # --------------------------------------------------------------------------- Hubble 트래픽 흐름 (/flows)
-def _flow_pair_row_html(pair: dict) -> str:
+def _flow_pair_row_html(pair: dict, *, scope: str, namespace: Optional[str]) -> str:
     port = f":{pair['dst_port']}" if pair.get("dst_port") else ""
     verdict = pair.get("verdict") or "-"
     v_color = _VERDICT_COLOR.get(verdict, "#4b5563")
+    # Source/Destination을 클릭하면 그 리소스에 focus가 걸린다("연결된 리소스만 보기"). 현재
+    # scope/namespace는 유지한다. focus는 endpoint 라벨(포트 없음)이므로 pair['src']/['dst']를 쓴다.
+    src_url = _flows_url(scope=scope, namespace=namespace, focus=pair["src"])
+    dst_url = _flows_url(scope=scope, namespace=namespace, focus=pair["dst"])
     return f"""
     <tr>
-      <td>{html.escape(pair['src'])}</td>
+      <td><a href="{html.escape(src_url)}">{html.escape(pair['src'])}</a></td>
       <td>→</td>
-      <td>{html.escape(pair['dst'])}{html.escape(port)}</td>
+      <td><a href="{html.escape(dst_url)}">{html.escape(pair['dst'])}</a>{html.escape(port)}</td>
       <td>{html.escape(pair['protocol'])}</td>
       <td><strong>{pair['count']}</strong></td>
       <td><span class="badge" style="background:{v_color}">{html.escape(verdict)}</span></td>
@@ -291,12 +319,14 @@ def _shorten(label: str, n: int = 32) -> str:
     return label if len(label) <= n else label[: n - 1] + "…"
 
 
-def _flow_diagram_svg(pairs: list, limit: int = 10) -> str:
+def _flow_diagram_svg(pairs: list, limit: int = 10, *, scope: str = "app",
+                      namespace: Optional[str] = None) -> str:
     """상위 연결 쌍을 source→destination 노드-링크(bipartite) 다이어그램으로 그린다.
 
     외부 라이브러리/JS 없이 서버에서 인라인 SVG로 생성한다(자동 새로고침·오프라인에서도 동작).
     선 굵기 ∝ 연결 수, 색 = 대표 verdict. 각 화살표에 <title>로 네이티브 hover 툴팁을 붙인다.
     가독성을 위해 상위 `limit`개만 그리며(전체는 아래 표에 있음), 노드는 등장 순서로 배치한다.
+    각 노드(원+라벨)는 그 리소스에 focus를 거는 링크다 — 표와 동일한 '연결된 리소스만 보기' 진입점.
     """
     pairs = [p for p in pairs[:limit]]
     if not pairs:
@@ -307,12 +337,14 @@ def _flow_diagram_svg(pairs: list, limit: int = 10) -> str:
 
     sources: List[str] = []
     dests: List[str] = []
+    dst_focus: dict = {}   # 표시문자열(포트 포함) -> focus에 쓸 endpoint 라벨(포트 없음)
     for p in pairs:
         if p["src"] not in sources:
             sources.append(p["src"])
         dd = _dst_disp(p)
         if dd not in dests:
             dests.append(dd)
+        dst_focus.setdefault(dd, p["dst"])
 
     left_x, right_x, row_h, top, width = 250, 510, 34, 54, 760
     src_y = {s: top + i * row_h for i, s in enumerate(sources)}
@@ -341,21 +373,31 @@ def _flow_diagram_svg(pairs: list, limit: int = 10) -> str:
             f'marker-end="url(#arw-{html.escape(v)})"><title>{html.escape(tip)}</title></path>'
         )
 
+    def _node_link(url: str, inner: str, label: str) -> str:
+        # SVG <a>로 원+라벨을 감싸 클릭 시 그 리소스에 focus. <title>로 전체 라벨 툴팁(축약 대비).
+        return (
+            f'<a href="{html.escape(url)}"><title>{html.escape(label)} 연결만 보기</title>'
+            f"{inner}</a>"
+        )
+
     nodes = []
     for s in sources:
         y = src_y[s]
-        nodes.append(f'<circle cx="{left_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>')
-        nodes.append(
+        inner = (
+            f'<circle cx="{left_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>'
             f'<text x="{left_x - 10}" y="{y + 4}" text-anchor="end" font-size="12" '
             f'fill="currentColor">{html.escape(_shorten(s))}</text>'
         )
+        nodes.append(_node_link(_flows_url(scope=scope, namespace=namespace, focus=s), inner, s))
     for d in dests:
         y = dst_y[d]
-        nodes.append(f'<circle cx="{right_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>')
-        nodes.append(
+        inner = (
+            f'<circle cx="{right_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>'
             f'<text x="{right_x + 10}" y="{y + 4}" text-anchor="start" font-size="12" '
             f'fill="currentColor">{html.escape(_shorten(d))}</text>'
         )
+        nodes.append(_node_link(
+            _flows_url(scope=scope, namespace=namespace, focus=dst_focus[d]), inner, d))
 
     headers = (
         f'<text x="{left_x - 10}" y="28" text-anchor="end" font-size="11" fill="currentColor" '
@@ -371,53 +413,118 @@ def _flow_diagram_svg(pairs: list, limit: int = 10) -> str:
     )
 
 
-def _scope_toggle_html(scope: str) -> str:
-    """애플리케이션 전용/전체 트래픽 전환 링크."""
-    prefix = _url_prefix()
-    app_cls = "active" if scope == "app" else ""
-    all_cls = "active" if scope == "all" else ""
+def _scope_toggle_html(summary: FlowSummary) -> str:
+    """애플리케이션 전용/전체 트래픽 전환 링크. 현재 namespace/focus 필터는 유지한다."""
+    app_cls = "active" if summary.scope == "app" else ""
+    all_cls = "active" if summary.scope == "all" else ""
+    app_url = _flows_url(scope="app", namespace=summary.namespace, focus=summary.focus)
+    all_url = _flows_url(scope="all", namespace=summary.namespace, focus=summary.focus)
     return (
-        '<div style="margin-bottom:1rem;font-size:.85rem">보기: '
-        f'<a href="{prefix}/flows?scope=app" class="{app_cls}">내 애플리케이션 트래픽</a> · '
-        f'<a href="{prefix}/flows?scope=all" class="{all_cls}">전체(인프라 포함)</a></div>'
+        '<div style="margin-bottom:.5rem;font-size:.85rem">보기: '
+        f'<a href="{html.escape(app_url)}" class="{app_cls}">내 애플리케이션 트래픽</a> · '
+        f'<a href="{html.escape(all_url)}" class="{all_cls}">전체(인프라 포함)</a></div>'
+    )
+
+
+def _namespace_filter_html(summary: FlowSummary) -> str:
+    """현재 scope에 등장하는 네임스페이스 선택 링크. '전체'는 ns 해제, 개별 ns는 focus 초기화.
+
+    scope만 적용한 목록(summary.namespaces)을 쓰므로, 어떤 필터가 걸려 있어도 다른
+    네임스페이스로 곧장 전환할 수 있다. 다른 ns로 옮기면 이전 리소스 focus는 대개 무의미하므로
+    개별 ns 링크는 focus를 넘기지 않아(초기화) 그 네임스페이스 전체를 보여준다.
+    """
+    if not summary.namespaces:
+        return ""
+    all_cls = "active" if not summary.namespace else ""
+    # '전체'(ns 해제)는 focus는 유지 — "이 리소스가 낀 흐름을 모든 ns에 걸쳐" 보고 싶을 수 있으므로.
+    parts = [
+        f'<a href="{html.escape(_flows_url(scope=summary.scope, focus=summary.focus))}" '
+        f'class="{all_cls}">전체</a>'
+    ]
+    for ns in summary.namespaces:
+        name = ns["name"]
+        cls = "active" if name == summary.namespace else ""
+        url = _flows_url(scope=summary.scope, namespace=name)
+        parts.append(
+            f'<a href="{html.escape(url)}" class="{cls}">{html.escape(name)}</a>'
+            f'<span class="sub">({ns["count"]})</span>'
+        )
+    return (
+        '<div style="margin-bottom:.5rem;font-size:.85rem">네임스페이스: '
+        + " · ".join(parts) + "</div>"
+    )
+
+
+def _focus_banner_html(summary: FlowSummary) -> str:
+    """focus(연결된 리소스) 상태 표시 + 해제 링크. focus가 없으면 사용법 힌트를 보여준다."""
+    if not summary.focus:
+        return (
+            '<div class="sub" style="margin-bottom:1rem">💡 아래 표·다이어그램에서 '
+            "Source·Destination을 클릭하면 그 리소스와 연결된 흐름만 볼 수 있습니다.</div>"
+        )
+    clear_url = _flows_url(scope=summary.scope, namespace=summary.namespace)
+    return (
+        '<div class="help" style="margin-bottom:1rem">'
+        f'선택한 리소스 <code>{html.escape(summary.focus)}</code> 와(과) 연결된 흐름만 표시 중 · '
+        f'<a href="{html.escape(clear_url)}">× 선택 해제</a></div>'
     )
 
 
 def _render_flows(summary: FlowSummary) -> str:
-    toggle = _scope_toggle_html(summary.scope)
+    # 필터 컨트롤(스코프/네임스페이스/포커스)은 조회 실패·빈 상태에서도 항상 보이게 상단에 둔다.
+    controls = (
+        _scope_toggle_html(summary)
+        + _namespace_filter_html(summary)
+        + _focus_banner_html(summary)
+    )
     help_panel = _flows_help_html()
     scope_label = "내 애플리케이션 Pod" if summary.scope == "app" else "전체(인프라 포함)"
+    filter_label = "".join(
+        s for s in (
+            f" · 네임스페이스 {summary.namespace}" if summary.namespace else "",
+            f" · 리소스 {summary.focus}" if summary.focus else "",
+        )
+    )
 
     if summary.fetch_error:
-        table = toggle + help_panel + (
+        table = controls + help_panel + (
             f'<div class="error-row" style="padding:1rem">⚠ Hubble 조회 실패: '
             f'{html.escape(summary.fetch_error)}</div>'
         )
         meta = "Cilium Hubble 기반 실제 Pod 트래픽 흐름 · 조회 실패"
     elif summary.shown == 0:
-        # 전체는 있는데 앱 흐름만 0인 경우와, 애초에 아무 흐름도 없는 경우를 구분해서 안내한다.
-        if summary.scope == "app" and summary.total > 0:
+        # 왜 0건인지 상황별로 다르게 안내한다: (1) 필터(ns/focus) 때문 (2) 앱 흐름만 0 (3) 아예 없음.
+        if summary.namespace or summary.focus:
+            empty = (
+                '<div class="empty">이 필터에 해당하는 흐름이 최근 창에 없습니다. '
+                "위에서 필터를 바꾸거나 해제해 보세요.</div>"
+            )
+        elif summary.scope == "app" and summary.total > 0:
             empty = (
                 '<div class="empty">최근 창에서 애플리케이션 Pod 흐름이 관측되지 않았습니다. '
-                '전체 흐름은 있으니 아래 "전체(인프라 포함)"로 확인하세요.</div>'
+                '전체 흐름은 있으니 위 "전체(인프라 포함)"로 확인하세요.</div>'
             )
         else:
             empty = '<div class="empty">관측된 흐름이 없습니다.</div>'
-        table = toggle + help_panel + empty
-        meta = f"Cilium Hubble 기반 · {scope_label} 0건 (전체 {summary.total}건)"
+        table = controls + help_panel + empty
+        meta = f"Cilium Hubble 기반 · {scope_label}{filter_label} 0건 (전체 {summary.total}건)"
     else:
         badges = " ".join(
             f'<span class="badge" style="background:{_VERDICT_COLOR.get(v, "#4b5563")}">{html.escape(v)} {c}</span>'
             for v, c in summary.verdicts.items()
         )
-        diagram = _flow_diagram_svg(summary.top_pairs)
+        diagram = _flow_diagram_svg(summary.top_pairs, scope=summary.scope, namespace=summary.namespace)
         shown_in_diagram = min(10, len(summary.top_pairs))
         diagram_cap = (
             f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결 쌍 도식화 '
-            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 화살표에 마우스를 올리면 상세.</p>"
+            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 화살표에 마우스를 올리면 상세, "
+            "노드를 클릭하면 그 리소스 연결만 보기.</p>"
         )
-        rows = "\n".join(_flow_pair_row_html(p) for p in summary.top_pairs)
-        table = toggle + help_panel + diagram + diagram_cap + f"""<div style="margin-bottom:1rem">{badges}</div>
+        rows = "\n".join(
+            _flow_pair_row_html(p, scope=summary.scope, namespace=summary.namespace)
+            for p in summary.top_pairs
+        )
+        table = controls + help_panel + diagram + diagram_cap + f"""<div style="margin-bottom:1rem">{badges}</div>
 <table>
 <thead><tr>
   <th>Source</th><th></th><th>Destination</th><th>Proto</th><th>Count</th><th>Verdict</th><th>Last Seen (UTC)</th>
@@ -425,7 +532,7 @@ def _render_flows(summary: FlowSummary) -> str:
 <tbody>{rows}</tbody>
 </table>"""
         meta = (
-            f"Cilium Hubble 기반 실제 Pod 트래픽 흐름(L3/L4, HTTP RPS 아님) · {scope_label} · "
+            f"Cilium Hubble 기반 실제 Pod 트래픽 흐름(L3/L4, HTTP RPS 아님) · {scope_label}{filter_label} · "
             f"최근 전체 {summary.total}건 중 애플리케이션 {summary.app_flows}건, "
             f"현재 보기 {summary.shown}건에서 상위 {len(summary.top_pairs)}개 연결 쌍"
         )
@@ -455,19 +562,30 @@ def api_policies():
 
 
 @app.get("/flows", response_class=HTMLResponse)
-def flows(scope: str = "app") -> str:
-    return _render_flows(hubble_flows.fetch_summary(scope=_normalize_scope(scope)))
+def flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+    return _render_flows(hubble_flows.fetch_summary(
+        scope=_normalize_scope(scope),
+        namespace=_clean_param(namespace),
+        focus=_clean_param(focus),
+    ))
 
 
 @app.get("/api/flows", response_class=JSONResponse)
-def api_flows(scope: str = "app"):
-    summary = hubble_flows.fetch_summary(scope=_normalize_scope(scope))
+def api_flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None):
+    summary = hubble_flows.fetch_summary(
+        scope=_normalize_scope(scope),
+        namespace=_clean_param(namespace),
+        focus=_clean_param(focus),
+    )
     return {
         "generatedAt": time.time(),
         "total": summary.total,
         "shown": summary.shown,
         "scope": summary.scope,
+        "namespace": summary.namespace,
+        "focus": summary.focus,
         "appFlows": summary.app_flows,
+        "namespaces": summary.namespaces,
         "verdicts": summary.verdicts,
         "topPairs": summary.top_pairs,
         "fetchError": summary.fetch_error,
