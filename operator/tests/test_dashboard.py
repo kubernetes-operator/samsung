@@ -7,6 +7,7 @@ list_cluster_custom_object/list_namespaced_custom_object 호출만 검증하면 
 from __future__ import annotations
 
 import base64
+import re
 import time
 from unittest.mock import MagicMock
 
@@ -350,11 +351,13 @@ def test_default_refresh_is_one_minute(monkeypatch):
     assert 'http-equiv="refresh" content="60"' in _flows_client(monkeypatch).get("/").text
 
 
-def test_refresh_selector_has_all_five_options(monkeypatch):
+def test_refresh_selector_is_dropdown_with_all_options_and_button(monkeypatch):
     text = _flows_client(monkeypatch).get("/").text
-    assert 'class="refresh-seg"' in text            # 셀 형태 세그먼트 버튼
+    assert 'class="refresh-select"' in text          # 드롭다운(스크롤 선택)
+    assert 'class="refresh-now"' in text             # 수동 새로고침 버튼(↻)
+    assert "location.reload()" in text
     for label in ("10초", "30초", "1분", "10분", "안 함"):
-        assert label in text
+        assert f">{label}</option>" in text
 
 
 def test_refresh_selector_is_in_topbar(monkeypatch):
@@ -362,10 +365,10 @@ def test_refresh_selector_is_in_topbar(monkeypatch):
     text = _flows_client(monkeypatch).get("/").text
     topbar = text.split('<header class="topbar">')[1].split("</header>")[0]
     body = text.split("</header>")[1]
-    assert 'class="refresh-seg"' in topbar          # 상단바 안에 존재
-    assert "refresh-seg" not in body                # 본문에는 없음
-    # 현재 선택(기본 1분)이 active 셀로 강조되어야 한다.
-    assert 'class="seg active"' in text and 'aria-current="true"' in text
+    assert 'class="refresh-ctl"' in topbar           # 상단바 안에 존재
+    assert "refresh-select" not in body              # 본문에는 없음
+    # 현재 선택(기본 1분)이 드롭다운에서 selected여야 한다.
+    assert "selected>1분</option>" in text
 
 
 def test_refresh_override_changes_meta(monkeypatch):
@@ -462,6 +465,33 @@ def test_flow_graph_svg_empty_for_no_edges():
     assert dashboard_app._flow_graph_svg([], []) == ""
 
 
+def _one_pair_summary():
+    return FlowSummary(
+        total=3, shown=3, app_flows=3, verdicts={"FORWARDED": 3},
+        top_pairs=[{
+            "src": "shop/checkout-abc", "dst": "shop/cart-def", "protocol": "TCP",
+            "dst_port": 8080, "count": 3, "verdict": "FORWARDED",
+            "last_seen": "2026-07-19T12:00:00.000000000Z",
+        }],
+    )
+
+
+def test_help_panel_is_below_diagram(monkeypatch):
+    """설명 패널(class=help)이 다이어그램(class=diagram) '아래'에 와야 한다."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: _one_pair_summary())
+    text = _authed_client().get("/flows").text
+    assert text.index('class="diagram"') < text.index('class="help"')
+
+
+def test_diagram_renders_at_natural_size(monkeypatch):
+    """다이어그램은 컨테이너에 맞춰 축소하지 않고 자연 크기(px width/height)로 렌더된다(크게)."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: _one_pair_summary())
+    text = _authed_client().get("/flows").text
+    svg = text.split('class="diagram"')[1].split("</svg>")[0]
+    assert 'width="100%"' not in svg                    # 축소용 100% 아님
+    assert re.search(r'<svg[^>]*width="\d+"[^>]*height="\d+"', svg)  # 자연 px 크기
+
+
 def test_flow_graph_svg_limits_to_top_n():
     """그래프는 가독성을 위해 상위 N개 간선만 그린다(표에는 전체가 있음). 노드는 합성 가능."""
     edges = [
@@ -508,7 +538,7 @@ def test_flow_graph_edges_uniform_width_and_speed_by_count():
     ]
     svg = dashboard_app._flow_graph_svg(nodes, edges)
     widths = set(re.findall(r'class="flow-edge"[^>]*stroke-width="([\d.]+)"', svg))
-    assert widths == {"2.6"}                         # 모든 화살표 두께 동일(연결 수와 무관)
+    assert widths == {"3.2"}                         # 모든 화살표 두께 동일(연결 수와 무관, 크게)
     durs = sorted(float(d) for d in re.findall(r"animation-duration:([\d.]+)s", svg))
     assert len(durs) == 2 and durs[0] < durs[1]      # 연결 많은 쪽이 더 짧은 주기(빠른 흐름)
     assert abs(durs[0] - 0.5) < 0.01                 # 최다 연결 = 가장 빠름(DUR_FAST)
@@ -606,22 +636,33 @@ def _flows_summary(**kw) -> FlowSummary:
     return FlowSummary(**base)
 
 
-def test_flows_page_shows_namespace_filter_links(monkeypatch):
-    """네임스페이스 목록이 선택 링크로 렌더되고, 각 링크는 scope를 유지한 /flows URL이어야 한다."""
+def test_flows_page_shows_namespace_filter_buttons(monkeypatch):
+    """네임스페이스 목록이 선택 버튼(pill)으로 렌더되고, 각 버튼은 scope를 유지한 /flows URL이어야 한다."""
     summary = _flows_summary(namespaces=[{"name": "shop", "count": 5}, {"name": "pay", "count": 2}])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
     text = _authed_client().get("/").text
-    assert "네임스페이스:" in text
+    assert '<span class="segctl-label">네임스페이스</span>' in text   # 선택 버튼 그룹 라벨
     assert 'href="/?scope=app&amp;namespace=shop' in text
     assert 'href="/?scope=app&amp;namespace=pay' in text
-    assert ">shop</a>" in text and "(5)" in text
+    assert 'class="seg"' in text and "shop" in text and "(5)" in text
 
 
 def test_flows_page_marks_active_namespace(monkeypatch):
     summary = _flows_summary(namespace="shop", namespaces=[{"name": "shop", "count": 5}])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
     text = _authed_client().get("/flows").text
-    assert 'class="active">shop</a>' in text
+    assert 'class="seg active"' in text and 'aria-current="true"' in text
+    # active 버튼이 shop이어야 한다.
+    assert re.search(r'class="seg active"[^>]*>\s*shop', text)
+
+
+def test_flows_scope_toggle_is_button_group(monkeypatch):
+    """'보기'(scope)도 선택 버튼(세그먼트)으로 렌더돼야 한다."""
+    summary = _flows_summary()
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/").text
+    assert '<span class="segctl-label">보기</span>' in text
+    assert "내 애플리케이션 트래픽" in text and "전체(인프라 포함)" in text
 
 
 def test_flows_source_destination_are_focus_links(monkeypatch):

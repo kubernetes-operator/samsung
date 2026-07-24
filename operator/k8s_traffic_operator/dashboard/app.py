@@ -83,25 +83,44 @@ def _refresh_meta_tag() -> str:
     return "" if r == "off" else f'<meta http-equiv="refresh" content="{int(r)}">'
 
 
-def _refresh_selector_html(option_url) -> str:
-    """자동 새로고침 선택 컨트롤(상단바). 셀 형태 **세그먼트 버튼**으로 현재 선택을 강조한다.
+def _seg_control_html(label: str, options) -> str:
+    """라벨 + 선택 버튼(pill) 그룹. options = [(inner_html, url, active), ...].
 
-    `option_url(value)`가 각 옵션의 링크 URL을 만든다(무JS — meta refresh + 링크 이동).
+    본문 필터(보기·네임스페이스)를 텍스트 링크 대신 선택 버튼 형태로 렌더한다. `inner_html`은
+    이미 안전하게 구성된 조각(호출부에서 이스케이프)이며, `url`은 이스케이프해서 넣는다.
     """
-    cur = _refresh_var.get()
     cells = []
-    for val, label in _REFRESH_OPTIONS:
-        active = val == cur
+    for inner, url, active in options:
         cls = "seg active" if active else "seg"
         cur_attr = ' aria-current="true"' if active else ""
-        cells.append(
-            f'<a href="{html.escape(option_url(val))}" class="{cls}"{cur_attr}>'
-            f"{html.escape(label)}</a>"
-        )
+        cells.append(f'<a href="{html.escape(url)}" class="{cls}"{cur_attr}>{inner}</a>')
     return (
-        '<div class="refresh-seg" role="group" aria-label="자동 새로고침 주기">'
-        '<span class="refresh-seg-label">자동 새로고침</span>'
+        '<div class="segctl">'
+        f'<span class="segctl-label">{html.escape(label)}</span>'
         '<span class="seg-cells">' + "".join(cells) + "</span></div>"
+    )
+
+
+def _refresh_selector_html(option_url) -> str:
+    """자동 새로고침 컨트롤(상단바): **드롭다운(스크롤 선택)** + **수동 새로고침 버튼(↻)**.
+
+    `option_url(value)`가 각 옵션(주기)에 대한 이동 URL을 만든다. 드롭다운은 onchange로 해당
+    URL로 이동하고, ↻ 버튼은 현재 페이지를 즉시 다시 불러온다(location.reload()).
+    """
+    cur = _refresh_var.get()
+    opts = "".join(
+        f'<option value="{html.escape(option_url(val))}"{" selected" if val == cur else ""}>'
+        f"{html.escape(label)}</option>"
+        for val, label in _REFRESH_OPTIONS
+    )
+    return (
+        '<div class="refresh-ctl">'
+        '<label class="refresh-ctl-label" for="refresh-select">자동 새로고침</label>'
+        '<select id="refresh-select" class="refresh-select" aria-label="자동 새로고침 주기" '
+        'onchange="if(this.value)location.href=this.value">' + opts + "</select>"
+        '<button type="button" class="refresh-now" title="지금 새로고침" '
+        'aria-label="지금 새로고침" onclick="location.reload()">↻</button>'
+        "</div>"
     )
 
 
@@ -212,17 +231,24 @@ _STYLE = """
          padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 14px; text-decoration: none; }
   .tab:hover { color: var(--fg); }
   .tab.active { background: var(--card-bg); color: var(--fg); border-color: var(--border); }
-  /* 상단바 우측 그룹: 자동 새로고침 세그먼트 + 로그인 박스. */
+  /* 상단바 우측 그룹: 자동 새로고침(드롭다운 + 수동 새로고침 버튼) + 로그인 박스. */
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-  /* 자동 새로고침 = 셀 형태 세그먼트 버튼(현재 선택 강조). 무JS 링크(meta refresh + 이동). */
-  .refresh-seg { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-  .refresh-seg-label { color: var(--muted); white-space: nowrap; }
-  .seg-cells { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-  .seg { padding: 4px 10px; color: var(--muted); text-decoration: none; white-space: nowrap;
-         border-left: 1px solid var(--border); }
-  .seg:first-child { border-left: none; }
-  .seg:hover { color: var(--fg); background: var(--card-bg); }
-  .seg.active { background: var(--info); color: #fff; font-weight: 600; }
+  .refresh-ctl { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .refresh-ctl-label { color: var(--muted); white-space: nowrap; }
+  .refresh-select { font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid var(--border);
+                    border-radius: 6px; background: var(--bg); color: var(--fg); cursor: pointer; }
+  .refresh-now { font-size: 13px; line-height: 1; padding: 4px 9px; border: 1px solid var(--border);
+                 border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; }
+  .refresh-now:hover { background: var(--info); color: #fff; border-color: var(--info); }
+  /* 본문 필터(보기·네임스페이스) = 선택 버튼(pill). 많은 항목은 줄바꿈된다. 현재 선택 강조. */
+  .segctl { display: flex; align-items: center; gap: 8px; margin-bottom: .6rem; font-size: 13px; flex-wrap: wrap; }
+  .segctl-label { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  .seg-cells { display: flex; flex-wrap: wrap; gap: 4px; }
+  .seg { padding: 3px 11px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted);
+         text-decoration: none; white-space: nowrap; background: var(--card-bg); }
+  .seg:hover { color: var(--fg); }
+  .seg.active { background: var(--info); color: #fff; border-color: var(--info); font-weight: 600; }
+  .segcount { opacity: .7; font-size: .85em; }
   main { padding: 20px; max-width: 1100px; margin: 0 auto; }
   h2.page-title { font-size: 18px; margin: 0 0 4px; }
   a.active { color: inherit; font-weight: 600; text-decoration: underline; }
@@ -470,7 +496,7 @@ def _flows_help_html() -> str:
     return (
         '<div class="help">'
         "<p><strong>이 페이지는 무엇인가요?</strong> Cilium(CNI)의 <strong>Hubble</strong>이 관측한 "
-        "<em>실제 Pod 간 네트워크 연결</em>입니다(L3/L4 수준). 아래 다이어그램에서 "
+        "<em>실제 Pod 간 네트워크 연결</em>입니다(L3/L4 수준). 위 다이어그램에서 "
         "<strong>화살표</strong>는 연결 방향(source → destination)이며 <strong>전기가 흐르듯</strong> "
         "애니메이션됩니다 — 연결이 잦은 경로일수록 <strong>더 빠르게</strong> 흐릅니다(두께는 모두 동일). "
         "화살표 가운데 <strong>숫자</strong>가 실제 관측된 연결 수이고, <strong>색</strong>은 "
@@ -503,9 +529,9 @@ _KIND_LABEL = {"app": "앱", "infra": "인프라", "reserved": "예약"}
 
 
 def _chip_width(label: str, sub: str) -> float:
-    """칩 폭 추정(글자수 기반, SVG는 실측정이 없으므로). 앞뒤 여백 포함, 90~240px로 클램프."""
+    """칩 폭 추정(글자수 기반, SVG는 실측정이 없으므로). 앞뒤 여백 포함, 120~320px로 클램프(크게)."""
     chars = max(len(label), len(sub))
-    return max(90.0, min(240.0, chars * 6.7 + 18))
+    return max(120.0, min(320.0, chars * 7.8 + 26))
 
 
 def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "app",
@@ -569,8 +595,8 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             idx = _index()
             columns[L].sort(key=lambda n, idx=idx: _bary(n, out_adj, idx))
 
-    # --- 좌표 배치. '넓게 표현해도 된다'는 요구에 맞춰 열 간격·행 간격을 넉넉히 준다.
-    chip_h, row_h, pad_top, pad_x, col_gap = 36, 60, 50, 16, 150
+    # --- 좌표 배치. '크게'(가독) 요구에 맞춰 칩/열/행 간격을 키운다(약 1.35x).
+    chip_h, row_h, pad_top, pad_x, col_gap = 46, 82, 58, 22, 210
     slot_w = {
         L: max(_chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26)) for n in columns[L])
         for L in columns
@@ -622,12 +648,12 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
     span = (max_count - min_count) or 1
     used_verdicts = {e.get("verdict") or "FORWARDED" for e in edges}
     markers = "".join(
-        f'<marker id="arw-{html.escape(v)}" markerWidth="8" markerHeight="8" refX="6.5" refY="3" '
-        f'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="{_VERDICT_COLOR.get(v, "#4b5563")}"/></marker>'
+        f'<marker id="arw-{html.escape(v)}" markerWidth="10" markerHeight="10" refX="8" refY="4" '
+        f'orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="{_VERDICT_COLOR.get(v, "#4b5563")}"/></marker>'
         for v in used_verdicts
     )
 
-    EDGE_W = 2.6                    # 모든 화살표 두께 균일(연결 수와 무관)
+    EDGE_W = 3.2                    # 모든 화살표 두께 균일(연결 수와 무관, 크게)
     DUR_FAST, DUR_SLOW = 0.5, 3.0   # 흐름 애니메이션 주기(초): 연결 많음=빠름(짧은 주기)
 
     def _cubic_mid(p0, c1, c2, p3):  # 3차 베지어 t=0.5 지점(연결 수 라벨 위치)
@@ -646,12 +672,12 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
             # 자기 자신으로의 흐름: 칩 오른쪽에 작은 고리로 그린다(드묾).
             x = col_x[s_layer] + node_cw[e["src"]]
             y = src_py[i]
-            content_right = max(content_right, x + 44)  # 고리가 오른쪽으로 잘리지 않게 폭 확장
-            p0, c1, c2, p3 = (x, y), (x + 44, y - 24), (x + 44, y + 24), (x, y + 3)
+            content_right = max(content_right, x + 56)  # 고리가 오른쪽으로 잘리지 않게 폭 확장
+            p0, c1, c2, p3 = (x, y), (x + 56, y - 30), (x + 56, y + 30), (x, y + 4)
         else:
             sx = col_x[s_layer] + node_cw[e["src"]]
             sy = src_py[i]
-            ex = col_x[d_layer] - 9
+            ex = col_x[d_layer] - 11
             ey = dst_py[i]
             if ex > sx:  # 정방향(왼→오): 수평 중간점을 제어점으로 하는 S커브.
                 cx = (sx + ex) / 2
@@ -673,7 +699,7 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         # 실제 연결 수를 화살표 가운데에 표기(배경색 halo로 선 위에서도 읽히게). 정적(애니메이션 없음).
         mx, my = _cubic_mid(p0, c1, c2, p3)
         edge_svg.append(
-            f'<text x="{mx:.0f}" y="{my - 3:.0f}" text-anchor="middle" font-size="10" '
+            f'<text x="{mx:.0f}" y="{my - 4:.0f}" text-anchor="middle" font-size="12" '
             f'font-weight="700" fill="{color}" '
             f'style="paint-order:stroke;stroke:var(--card-bg);stroke-width:3px">{e["count"]}</text>'
         )
@@ -690,43 +716,44 @@ def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "
         label_disp = _shorten(lbl, 26)
         url = _flows_url(scope=scope, namespace=namespace, focus=lbl)
         sub_svg = (
-            f'<text x="{x + 10:.0f}" y="{y + 27:.0f}" font-size="9" fill="currentColor" '
+            f'<text x="{x + 13:.0f}" y="{y + 33:.0f}" font-size="11" fill="currentColor" '
             f'opacity="0.6">{html.escape(sub)}</text>' if sub else ""
         )
         node_svg.append(
             f'<a href="{html.escape(url)}"><title>{html.escape(lbl)} 연결만 보기</title>'
-            f'<rect x="{x:.0f}" y="{y:.0f}" width="{cw:.0f}" height="{chip_h}" rx="7" '
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{cw:.0f}" height="{chip_h}" rx="9" '
             f'fill="{fill}" stroke="{stroke}"{dash} stroke-width="1"/>'
-            f'<text x="{x + 10:.0f}" y="{y + 16:.0f}" font-size="11.5" fill="currentColor">'
+            f'<text x="{x + 13:.0f}" y="{y + 20:.0f}" font-size="14" fill="currentColor">'
             f'{html.escape(label_disp)}</text>{sub_svg}</a>'
         )
 
-    height = content_bottom + 14
-    width = content_right + 8
+    height = content_bottom + 16
+    width = content_right + 10
 
     caption = (
-        f'<text x="{pad_x}" y="30" font-size="11" fill="currentColor" opacity="0.6">'
+        f'<text x="{pad_x}" y="34" font-size="13" fill="currentColor" opacity="0.6">'
         f'→ 오른쪽으로 갈수록 다음 단계(hop) · 칩=리소스, 아래줄=워크로드</text>'
     )
+    # '크게' 요구: 컨테이너에 맞춰 축소하지 않고 자연 크기(px)로 렌더한다(축소하면 커진 효과가
+    # 사라짐). 자연 폭이 화면보다 넓으면 .diagram(overflow-x:auto)이 가로 스크롤한다.
     return (
-        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" width="100%" '
-        f'style="max-width:{width:.0f}px;height:auto;display:block" role="img" '
+        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height:.0f}" '
+        f'width="{width:.0f}" height="{height:.0f}" style="display:block" role="img" '
         f'aria-label="멀티홉 Pod 트래픽 흐름 그래프">'
         f"<defs>{markers}</defs>{caption}{''.join(edge_svg)}{''.join(node_svg)}</svg></div>"
     )
 
 
 def _scope_toggle_html(summary: FlowSummary) -> str:
-    """애플리케이션 전용/전체 트래픽 전환 링크. 현재 namespace/focus 필터는 유지한다."""
-    app_cls = "active" if summary.scope == "app" else ""
-    all_cls = "active" if summary.scope == "all" else ""
-    app_url = _flows_url(scope="app", namespace=summary.namespace, focus=summary.focus)
-    all_url = _flows_url(scope="all", namespace=summary.namespace, focus=summary.focus)
-    return (
-        '<div style="margin-bottom:.5rem;font-size:.85rem">보기: '
-        f'<a href="{html.escape(app_url)}" class="{app_cls}">내 애플리케이션 트래픽</a> · '
-        f'<a href="{html.escape(all_url)}" class="{all_cls}">전체(인프라 포함)</a></div>'
-    )
+    """애플리케이션 전용/전체 트래픽 전환 = 선택 버튼. 현재 namespace/focus 필터는 유지한다."""
+    return _seg_control_html("보기", [
+        ("내 애플리케이션 트래픽",
+         _flows_url(scope="app", namespace=summary.namespace, focus=summary.focus),
+         summary.scope == "app"),
+        ("전체(인프라 포함)",
+         _flows_url(scope="all", namespace=summary.namespace, focus=summary.focus),
+         summary.scope == "all"),
+    ])
 
 
 def _namespace_filter_html(summary: FlowSummary) -> str:
@@ -738,24 +765,16 @@ def _namespace_filter_html(summary: FlowSummary) -> str:
     """
     if not summary.namespaces:
         return ""
-    all_cls = "active" if not summary.namespace else ""
     # '전체'(ns 해제)는 focus는 유지 — "이 리소스가 낀 흐름을 모든 ns에 걸쳐" 보고 싶을 수 있으므로.
-    parts = [
-        f'<a href="{html.escape(_flows_url(scope=summary.scope, focus=summary.focus))}" '
-        f'class="{all_cls}">전체</a>'
+    options = [
+        ("전체", _flows_url(scope=summary.scope, focus=summary.focus), not summary.namespace)
     ]
     for ns in summary.namespaces:
         name = ns["name"]
-        cls = "active" if name == summary.namespace else ""
-        url = _flows_url(scope=summary.scope, namespace=name)
-        parts.append(
-            f'<a href="{html.escape(url)}" class="{cls}">{html.escape(name)}</a>'
-            f'<span class="sub">({ns["count"]})</span>'
-        )
-    return (
-        '<div style="margin-bottom:.5rem;font-size:.85rem">네임스페이스: '
-        + " · ".join(parts) + "</div>"
-    )
+        inner = f'{html.escape(name)} <span class="segcount">({ns["count"]})</span>'
+        options.append((inner, _flows_url(scope=summary.scope, namespace=name),
+                        name == summary.namespace))
+    return _seg_control_html("네임스페이스", options)
 
 
 def _focus_banner_html(summary: FlowSummary) -> str:
@@ -790,10 +809,10 @@ def _render_flows(summary: FlowSummary) -> str:
     )
 
     if summary.fetch_error:
-        table = controls + help_panel + (
+        table = controls + (
             f'<div class="error-row" style="padding:1rem">⚠ Hubble 조회 실패: '
             f'{html.escape(summary.fetch_error)}</div>'
-        )
+        ) + help_panel
         meta = "Cilium Hubble 기반 실제 Pod 트래픽 흐름 · 조회 실패"
     elif summary.shown == 0:
         # 왜 0건인지 상황별로 다르게 안내한다: (1) 필터(ns/focus) 때문 (2) 앱 흐름만 0 (3) 아예 없음.
@@ -809,7 +828,7 @@ def _render_flows(summary: FlowSummary) -> str:
             )
         else:
             empty = '<div class="empty">관측된 흐름이 없습니다.</div>'
-        table = controls + help_panel + empty
+        table = controls + empty + help_panel
         meta = f"Cilium Hubble 기반 · {scope_label}{filter_label} 0건 (전체 {summary.total}건)"
     else:
         badges = " ".join(
@@ -829,7 +848,7 @@ def _render_flows(summary: FlowSummary) -> str:
             _flow_pair_row_html(p, scope=summary.scope, namespace=summary.namespace)
             for p in summary.top_pairs
         )
-        table = controls + help_panel + diagram + diagram_cap + f"""<div style="margin-bottom:1rem">{badges}</div>
+        table = controls + diagram + diagram_cap + help_panel + f"""<div style="margin-bottom:1rem">{badges}</div>
 <table>
 <thead><tr>
   <th>Source</th><th></th><th>Destination</th><th>Proto</th><th>Count</th><th>Verdict</th><th>Last Seen (UTC)</th>
