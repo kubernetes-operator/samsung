@@ -65,7 +65,7 @@ spec:
       serviceAccountName: traffic-policy-dashboard
       containers:
         - name: dashboard
-          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.1
+          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.2
           ports:
             - containerPort: 8080
           env:
@@ -100,8 +100,11 @@ spec:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 10
           resources:
-            requests: { cpu: "10m", memory: "64Mi" }
-            limits: { cpu: "200m", memory: "128Mi" }
+            # /flows는 요청 시 hubble CLI(별도 Go 프로세스, 큰 RSS)를 띄운다. 코드 쪽에서
+            # single-flight + TTL 캐시로 동시 서브프로세스를 1개로 제한하지만, uvicorn+hubble가
+            # 겹치는 순간을 위해 상한에 여유를 둔다(128Mi는 정상 사용에서도 빠듯해 OOM 관측됨).
+            requests: { cpu: "10m", memory: "96Mi" }
+            limits: { cpu: "300m", memory: "256Mi" }
 ---
 apiVersion: v1
 kind: Service

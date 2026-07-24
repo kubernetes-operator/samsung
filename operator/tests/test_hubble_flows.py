@@ -10,8 +10,18 @@ import json
 import subprocess
 from unittest.mock import MagicMock
 
+import pytest
+
 from k8s_traffic_operator.dashboard import hubble_flows as hf
 from k8s_traffic_operator.hubble_client import _parse_flow_line
+
+
+@pytest.fixture(autouse=True)
+def _clear_flows_cache():
+    """fetch_summary의 hubble 결과 캐시가 테스트 간에 새지 않도록 매 테스트 전 초기화."""
+    hf._reset_flows_cache()
+    yield
+    hf._reset_flows_cache()
 
 
 def _flow_line(*, verdict="FORWARDED", dst_pod="cart-def", dst_ns="shop",
@@ -314,3 +324,47 @@ def test_summarize_node_kind_infra_and_reserved():
     assert kind["kube-system/coredns"] == "infra"
     assert kind["world"] == "reserved"
     assert kind["shop/web"] == "app"
+
+
+# --------------------------------------------------------------------------- hubble 조회 캐시(OOM 방지)
+def test_fetch_summary_caches_hubble_calls(monkeypatch):
+    """TTL 캐시로 연속/동시 요청이 hubble 서브프로세스를 한 번만 띄운다(동시 프로세스 급증→OOM 방지)."""
+    calls = {"n": 0}
+    lines = "\n".join([_flow_line(), _flow_line()])
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        return _fake_completed(lines)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a = hf.fetch_summary()               # 실제 조회 1회
+    b = hf.fetch_summary(scope="all")    # 같은 last → 캐시 재사용(서브프로세스 없음)
+    assert calls["n"] == 1
+    assert a.total == 2 and b.total == 2
+
+
+def test_fetch_summary_refetches_after_cache_reset(monkeypatch):
+    """캐시를 비우면(=TTL 만료 상당) 다시 조회한다."""
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        return _fake_completed(_flow_line())
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    hf.fetch_summary()
+    hf._reset_flows_cache()
+    hf.fetch_summary()
+    assert calls["n"] == 2
+
+
+def test_fetch_summary_does_not_cache_failures(monkeypatch):
+    """조회 실패는 캐시하지 않는다 — 다음 요청에서 다시 시도할 수 있어야 한다."""
+    def boom(*a, **kw):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert hf.fetch_summary().fetch_error is not None
+    # 실패가 캐시됐다면 아래에서 성공 mock으로 바꿔도 캐시된 실패가 남았을 것 — 그렇지 않아야 한다.
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _fake_completed(_flow_line()))
+    assert hf.fetch_summary().fetch_error is None

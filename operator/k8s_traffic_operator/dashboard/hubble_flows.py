@@ -26,6 +26,8 @@ SYSTEM_NAMESPACES는 환경변수 SYSTEM_NAMESPACES(콤마 구분)로 덮어쓸 
 from __future__ import annotations
 
 import os
+import threading
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -33,6 +35,39 @@ from typing import Dict, List, Optional
 from ..hubble_client import FlowEndpoint, FlowEvent, HubbleUnavailableError, fetch_flows
 
 HUBBLE_LAST = int(os.getenv("HUBBLE_LAST", "300"))  # 한 번에 가져올 최근 flow 개수
+
+# hubble 조회 결과 짧은 캐시 TTL(초). 대시보드는 10초마다 자동 새로고침되고 여러 뷰어가 동시에
+# 볼 수 있는데, 매 요청마다 hubble CLI(별도 프로세스, 큰 RSS)를 새로 띄우면 프로세스가 겹쳐
+# 메모리가 급증(OOM)한다. TTL 내 재요청은 캐시를 재사용해 서브프로세스 급증을 막는다.
+HUBBLE_CACHE_TTL_S = float(os.getenv("HUBBLE_CACHE_TTL_S", "6"))
+
+_flows_lock = threading.Lock()
+_flows_cache: Dict[str, object] = {"ts": None, "last": None, "flows": None}
+
+
+def _reset_flows_cache() -> None:
+    """캐시 초기화(테스트 격리용)."""
+    _flows_cache.update(ts=None, last=None, flows=None)
+
+
+def _fetch_flows_cached(last: int) -> List[FlowEvent]:
+    """hubble 서브프로세스 호출을 단일화(single-flight)하고 짧게 캐시한다 — OOM 방지 핵심.
+
+    락을 잡은 채로 조회하므로 동시에 들어온 요청은 하나만 실제로 hubble을 띄우고, 나머지는
+    락 해제 후 갓 채워진 캐시를 재사용한다(동시 서브프로세스 0→1로 제한). TTL 안이면 재조회
+    없이 캐시를 돌려준다. 실패(HubbleUnavailableError)는 캐시하지 않고 그대로 전파한다
+    (상위 fetch_summary가 fetch_error로 변환). FastAPI 동기 핸들러는 스레드풀에서 도므로
+    threading.Lock으로 직렬화된다.
+    """
+    now = time.monotonic()
+    with _flows_lock:
+        c = _flows_cache
+        if (c["flows"] is not None and c["last"] == last
+                and c["ts"] is not None and now - c["ts"] < HUBBLE_CACHE_TTL_S):
+            return c["flows"]  # type: ignore[return-value]
+        flows = fetch_flows(last)  # 예외는 그대로 올림(캐시하지 않음)
+        _flows_cache.update(ts=now, last=last, flows=flows)
+        return flows
 
 # 인프라로 간주할 네임스페이스(환경변수로 덮어쓰기 가능). 클러스터 운영 컴포넌트들 —
 # 사용자의 "내 애플리케이션"이 아닌 것들. 목록에 없는 네임스페이스는 애플리케이션으로 본다
@@ -244,9 +279,12 @@ def fetch_summary(
     namespace: Optional[str] = None,
     focus: Optional[str] = None,
 ) -> FlowSummary:
-    """대시보드가 호출하는 진입점. 실패 시 예외 대신 fetch_error가 채워진 FlowSummary를 반환한다."""
+    """대시보드가 호출하는 진입점. 실패 시 예외 대신 fetch_error가 채워진 FlowSummary를 반환한다.
+
+    hubble 조회는 _fetch_flows_cached로 단일화·캐시된다(동시 서브프로세스 급증→OOM 방지).
+    """
     try:
-        flows = fetch_flows(last)
+        flows = _fetch_flows_cached(last)
     except HubbleUnavailableError as exc:
         return FlowSummary(scope=scope, namespace=namespace, focus=focus, fetch_error=str(exc))
     return summarize(flows, scope=scope, namespace=namespace, focus=focus)
