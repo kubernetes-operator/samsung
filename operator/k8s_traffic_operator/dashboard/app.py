@@ -304,9 +304,15 @@ def _flows_help_html() -> str:
         "<em>실제 Pod 간 네트워크 연결</em>입니다(L3/L4 수준). 아래 다이어그램에서 "
         "<strong>화살표</strong>는 연결 방향(source → destination), <strong>선 굵기</strong>는 "
         "관측된 연결 수, <strong>색</strong>은 Cilium의 정책 <strong>판정(verdict)</strong>입니다.</p>"
+        "<p>다이어그램은 <strong>멀티홉 흐름 그래프</strong>입니다 — 각 리소스를 한 번만 그리고 "
+        "<strong>왼쪽에서 오른쪽으로 갈수록 다음 단계(hop)</strong>로 이어집니다. 그래서 "
+        "<code>A→B</code>와 <code>B→C</code>가 같이 관측되면 <code>A→B→C</code> 사슬로 연결돼 "
+        "보입니다(1:1 쌍은 인접한 두 열). 각 <strong>칩</strong>은 흐름에 참여한 리소스이며, "
+        "윗줄은 <code>네임스페이스/Pod</code>, 아랫줄(<code>▸</code>)은 그 <strong>워크로드</strong>"
+        "(Deployment/DaemonSet 등)입니다. 칩 테두리 색은 앱/인프라/예약 구분입니다.</p>"
         f'<p>{legend}</p>'
         '<p class="sub">· <strong>Count</strong>는 연결(flow) 수이며 HTTP 요청 수/RPS가 아닙니다. '
-        "· 목적지 포트는 라벨 뒤 <code>:포트</code>로 표시됩니다. "
+        "· 목적지 포트는 선 위 툴팁의 <code>:포트</code>로 표시됩니다. "
         "· <code>host</code>/<code>world</code>/<code>remote-node</code> 등은 개별 Pod이 아닌 "
         "예약 대상(클러스터 외부·노드 자신 등)입니다. "
         "· 이 화면은 <code>/</code>(정책 현황)와 <em>다른 데이터</em>입니다 — 그쪽은 오퍼레이터가 "
@@ -319,97 +325,130 @@ def _shorten(label: str, n: int = 32) -> str:
     return label if len(label) <= n else label[: n - 1] + "…"
 
 
-def _flow_diagram_svg(pairs: list, limit: int = 10, *, scope: str = "app",
-                      namespace: Optional[str] = None) -> str:
-    """상위 연결 쌍을 source→destination 노드-링크(bipartite) 다이어그램으로 그린다.
+# 노드 성격별 칩 색(테두리/배경). 흐름에 참여하는 리소스가 앱인지 인프라/예약 개체인지 구분.
+_KIND_STROKE = {"app": "#60a5fa", "infra": "#9ca3af", "reserved": "#9ca3af"}
+_KIND_FILL = {"app": "rgba(96,165,250,.14)", "infra": "rgba(148,163,184,.10)", "reserved": "rgba(148,163,184,.06)"}
+_KIND_LABEL = {"app": "앱", "infra": "인프라", "reserved": "예약"}
 
-    외부 라이브러리/JS 없이 서버에서 인라인 SVG로 생성한다(자동 새로고침·오프라인에서도 동작).
-    선 굵기 ∝ 연결 수, 색 = 대표 verdict. 각 화살표에 <title>로 네이티브 hover 툴팁을 붙인다.
-    가독성을 위해 상위 `limit`개만 그리며(전체는 아래 표에 있음), 노드는 등장 순서로 배치한다.
-    각 노드(원+라벨)는 그 리소스에 focus를 거는 링크다 — 표와 동일한 '연결된 리소스만 보기' 진입점.
+
+def _chip_width(label: str, sub: str) -> float:
+    """칩 폭 추정(글자수 기반, SVG는 실측정이 없으므로). 앞뒤 여백 포함, 90~240px로 클램프."""
+    chars = max(len(label), len(sub))
+    return max(90.0, min(240.0, chars * 6.7 + 18))
+
+
+def _flow_graph_svg(nodes: list, edges: list, limit: int = 10, *, scope: str = "app",
+                    namespace: Optional[str] = None) -> str:
+    """상위 연결을 계층형(멀티홉) 노드-링크 그래프로 그린다 — '다음 단계로 이어지는' 흐름 시각화.
+
+    bipartite(좌=source, 우=destination)와 달리 각 리소스를 한 번만 그리고, 진입점에서의 홉
+    수(layer)에 따라 왼→오 열로 배치한다. 그래서 A→B, B→C 가 있으면 A→B→C 사슬로 이어져
+    보인다(1:1 쌍은 인접 두 열). 각 노드는 리소스 칩(라벨=ns/pod, 아래줄=워크로드/성격)이며
+    클릭하면 그 리소스에 focus가 걸린다. 선 굵기 ∝ 연결 수, 색 = 대표 verdict.
+
+    외부 라이브러리/JS 없이 서버 인라인 SVG로 생성(자동 새로고침·오프라인 동작). 가독성을 위해
+    상위 `limit`개 간선만 그리며(전체는 아래 표), 그 간선에 닿는 노드만 그린다.
     """
-    pairs = [p for p in pairs[:limit]]
-    if not pairs:
+    edges = list(edges[:limit])
+    if not edges:
         return ""
 
-    def _dst_disp(p: dict) -> str:
-        return p["dst"] + (f":{p['dst_port']}" if p.get("dst_port") else "")
+    used_labels = {lbl for e in edges for lbl in (e["src"], e["dst"])}
+    by_label = {n["label"]: n for n in nodes if n["label"] in used_labels}
+    for lbl in used_labels:  # summary.nodes에 없던 라벨은 안전하게 합성(레이어 0, 메타 없음).
+        by_label.setdefault(lbl, {"label": lbl, "namespace": None, "workload": None, "kind": "app", "layer": 0})
 
-    sources: List[str] = []
-    dests: List[str] = []
-    dst_focus: dict = {}   # 표시문자열(포트 포함) -> focus에 쓸 endpoint 라벨(포트 없음)
-    for p in pairs:
-        if p["src"] not in sources:
-            sources.append(p["src"])
-        dd = _dst_disp(p)
-        if dd not in dests:
-            dests.append(dd)
-        dst_focus.setdefault(dd, p["dst"])
+    # 열(layer)별로 노드 그룹핑 → 열 안에서는 라벨순 정렬(안정적 배치).
+    columns: dict = {}
+    for n in by_label.values():
+        columns.setdefault(n["layer"], []).append(n)
+    for col in columns.values():
+        col.sort(key=lambda n: n["label"])
+    max_layer = max(columns)
 
-    left_x, right_x, row_h, top, width = 250, 510, 34, 54, 760
-    src_y = {s: top + i * row_h for i, s in enumerate(sources)}
-    dst_y = {d: top + i * row_h for i, d in enumerate(dests)}
-    height = top + max(len(sources), len(dests)) * row_h + 12
-    max_count = max((p["count"] for p in pairs), default=1) or 1
-    xm = (left_x + right_x) / 2
+    def _sub(n: dict) -> str:
+        if n.get("workload"):
+            return "▸ " + n["workload"]
+        if n["kind"] != "app":
+            return _KIND_LABEL.get(n["kind"], "")
+        return ""
 
-    used = {p.get("verdict") or "FORWARDED" for p in pairs}
+    # 열 폭 = 그 열에서 가장 넓은 칩. 열 x = 이전 열들 폭 + 열 간격(간선 공간) 누적.
+    chip_h, row_h, pad_top, pad_x, col_gap = 34, 46, 46, 12, 66
+    slot_w = {
+        L: max(_chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26)) for n in columns[L])
+        for L in columns
+    }
+    col_x, acc = {}, pad_x
+    for L in range(max_layer + 1):
+        col_x[L] = acc
+        acc += slot_w.get(L, 90) + col_gap
+    width = acc - col_gap + pad_x
+
+    pos = {}  # label -> (x, y, chip_w) — 왼쪽 위 모서리 + 폭
+    for L in range(max_layer + 1):
+        for i, n in enumerate(columns.get(L, [])):
+            cw = _chip_width(_shorten(n["label"], 26), _shorten(_sub(n), 26))
+            pos[n["label"]] = (col_x[L], pad_top + i * row_h, cw)
+    rows = max((len(c) for c in columns.values()), default=1)
+    height = pad_top + rows * row_h + 8
+
+    max_count = max((e["count"] for e in edges), default=1) or 1
+    used_verdicts = {e.get("verdict") or "FORWARDED" for e in edges}
     markers = "".join(
         f'<marker id="arw-{html.escape(v)}" markerWidth="8" markerHeight="8" refX="6.5" refY="3" '
         f'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="{_VERDICT_COLOR.get(v, "#4b5563")}"/></marker>'
-        for v in used
+        for v in used_verdicts
     )
 
-    edges = []
-    for p in pairs:
-        v = p.get("verdict") or "FORWARDED"
+    edge_svg = []
+    for e in edges:
+        v = e.get("verdict") or "FORWARDED"
         color = _VERDICT_COLOR.get(v, "#4b5563")
-        y1, y2 = src_y[p["src"]], dst_y[_dst_disp(p)]
-        sw = 1.5 + (p["count"] / max_count) * 7.5
-        tip = f'{p["src"]} → {_dst_disp(p)} · {p["protocol"]} · {p["count"]}건 · {v}'
-        edges.append(
-            f'<path d="M{left_x},{y1} C{xm},{y1} {xm},{y2} {right_x - 9},{y2}" fill="none" '
-            f'stroke="{color}" stroke-width="{sw:.1f}" stroke-opacity="0.7" '
+        sx, sy, sw_ = pos[e["src"]]
+        dx, dy, _ = pos[e["dst"]]
+        x1, y1 = sx + sw_, sy + chip_h / 2          # source 칩 오른쪽 가운데
+        x2, y2 = dx - 9, dy + chip_h / 2            # destination 칩 왼쪽(화살표 여백)
+        cx = (x1 + x2) / 2
+        thick = 1.4 + (e["count"] / max_count) * 7.0
+        port = f":{e['dst_port']}" if e.get("dst_port") else ""
+        tip = f'{e["src"]} → {e["dst"]}{port} · {e["protocol"]} · {e["count"]}건 · {v}'
+        edge_svg.append(
+            f'<path d="M{x1:.0f},{y1:.0f} C{cx:.0f},{y1:.0f} {cx:.0f},{y2:.0f} {x2:.0f},{y2:.0f}" '
+            f'fill="none" stroke="{color}" stroke-width="{thick:.1f}" stroke-opacity="0.7" '
             f'marker-end="url(#arw-{html.escape(v)})"><title>{html.escape(tip)}</title></path>'
         )
 
-    def _node_link(url: str, inner: str, label: str) -> str:
-        # SVG <a>로 원+라벨을 감싸 클릭 시 그 리소스에 focus. <title>로 전체 라벨 툴팁(축약 대비).
-        return (
-            f'<a href="{html.escape(url)}"><title>{html.escape(label)} 연결만 보기</title>'
-            f"{inner}</a>"
+    node_svg = []
+    for lbl, (x, y, cw) in pos.items():
+        n = by_label[lbl]
+        stroke = _KIND_STROKE.get(n["kind"], "#9ca3af")
+        fill = _KIND_FILL.get(n["kind"], "none")
+        dash = ' stroke-dasharray="3 2"' if n["kind"] == "reserved" else ""
+        sub = _shorten(_sub(n), 26)
+        label_disp = _shorten(lbl, 26)
+        url = _flows_url(scope=scope, namespace=namespace, focus=lbl)
+        sub_svg = (
+            f'<text x="{x + 9:.0f}" y="{y + 26:.0f}" font-size="9" fill="currentColor" '
+            f'opacity="0.6">{html.escape(sub)}</text>' if sub else ""
+        )
+        node_svg.append(
+            f'<a href="{html.escape(url)}"><title>{html.escape(lbl)} 연결만 보기</title>'
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{cw:.0f}" height="{chip_h}" rx="6" '
+            f'fill="{fill}" stroke="{stroke}"{dash} stroke-width="1"/>'
+            f'<text x="{x + 9:.0f}" y="{y + 15:.0f}" font-size="11.5" fill="currentColor">'
+            f'{html.escape(label_disp)}</text>{sub_svg}</a>'
         )
 
-    nodes = []
-    for s in sources:
-        y = src_y[s]
-        inner = (
-            f'<circle cx="{left_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>'
-            f'<text x="{left_x - 10}" y="{y + 4}" text-anchor="end" font-size="12" '
-            f'fill="currentColor">{html.escape(_shorten(s))}</text>'
-        )
-        nodes.append(_node_link(_flows_url(scope=scope, namespace=namespace, focus=s), inner, s))
-    for d in dests:
-        y = dst_y[d]
-        inner = (
-            f'<circle cx="{right_x}" cy="{y}" r="4" fill="currentColor" fill-opacity="0.55"/>'
-            f'<text x="{right_x + 10}" y="{y + 4}" text-anchor="start" font-size="12" '
-            f'fill="currentColor">{html.escape(_shorten(d))}</text>'
-        )
-        nodes.append(_node_link(
-            _flows_url(scope=scope, namespace=namespace, focus=dst_focus[d]), inner, d))
-
-    headers = (
-        f'<text x="{left_x - 10}" y="28" text-anchor="end" font-size="11" fill="currentColor" '
-        f'opacity="0.55">SOURCE (연결 시작)</text>'
-        f'<text x="{right_x + 10}" y="28" text-anchor="start" font-size="11" fill="currentColor" '
-        f'opacity="0.55">DESTINATION (대상) : PORT</text>'
+    caption = (
+        f'<text x="{pad_x}" y="26" font-size="11" fill="currentColor" opacity="0.6">'
+        f'→ 오른쪽으로 갈수록 다음 단계(hop) · 칩=리소스, 아래줄=워크로드</text>'
     )
     return (
-        f'<div class="diagram"><svg viewBox="0 0 {width} {height}" width="100%" '
-        f'style="max-width:{width}px;height:auto;display:block" role="img" '
-        f'aria-label="상위 Pod 연결 흐름 다이어그램">'
-        f"<defs>{markers}</defs>{headers}{''.join(edges)}{''.join(nodes)}</svg></div>"
+        f'<div class="diagram"><svg viewBox="0 0 {width:.0f} {height}" width="100%" '
+        f'style="max-width:{width:.0f}px;height:auto;display:block" role="img" '
+        f'aria-label="멀티홉 Pod 트래픽 흐름 그래프">'
+        f"<defs>{markers}</defs>{caption}{''.join(edge_svg)}{''.join(node_svg)}</svg></div>"
     )
 
 
@@ -513,12 +552,13 @@ def _render_flows(summary: FlowSummary) -> str:
             f'<span class="badge" style="background:{_VERDICT_COLOR.get(v, "#4b5563")}">{html.escape(v)} {c}</span>'
             for v, c in summary.verdicts.items()
         )
-        diagram = _flow_diagram_svg(summary.top_pairs, scope=summary.scope, namespace=summary.namespace)
+        diagram = _flow_graph_svg(summary.nodes, summary.top_pairs,
+                                  scope=summary.scope, namespace=summary.namespace)
         shown_in_diagram = min(10, len(summary.top_pairs))
         diagram_cap = (
-            f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결 쌍 도식화 '
-            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 화살표에 마우스를 올리면 상세, "
-            "노드를 클릭하면 그 리소스 연결만 보기.</p>"
+            f'<p class="diagram-cap">↑ 상위 {shown_in_diagram}개 연결을 멀티홉 그래프로 도식화 '
+            f"(전체 {len(summary.top_pairs)}개는 아래 표 참고) · 왼→오 = 다음 단계(hop), "
+            "선 위에 마우스를 올리면 프로토콜·포트·건수, 칩을 클릭하면 그 리소스 연결만 보기.</p>"
         )
         rows = "\n".join(
             _flow_pair_row_html(p, scope=summary.scope, namespace=summary.namespace)
@@ -588,6 +628,7 @@ def api_flows(scope: str = "app", namespace: Optional[str] = None, focus: Option
         "namespaces": summary.namespaces,
         "verdicts": summary.verdicts,
         "topPairs": summary.top_pairs,
+        "nodes": summary.nodes,
         "fetchError": summary.fetch_error,
     }
 

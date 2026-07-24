@@ -59,6 +59,8 @@ class FlowSummary:
     namespaces: List[dict] = field(default_factory=list)  # [{name, count}]
     verdicts: Dict[str, int] = field(default_factory=dict)
     top_pairs: List[dict] = field(default_factory=list)  # [{src, dst, count, last_seen, verdict}]
+    # top_pairs를 방향 그래프로 본 노드 목록. 다음 단계(멀티홉) 흐름을 계층으로 펼쳐 그리는 데 쓴다.
+    nodes: List[dict] = field(default_factory=list)  # [{label, namespace, workload, kind, layer}]
     fetch_error: Optional[str] = None
 
 
@@ -95,6 +97,44 @@ def _flow_in_namespace(ev: FlowEvent, namespace: str) -> bool:
 def _flow_touches(ev: FlowEvent, label: str) -> bool:
     """특정 리소스(endpoint 라벨)가 이 흐름의 한쪽 끝인가 — '연결된 리소스만 보기'용."""
     return ev.src.label == label or ev.dst.label == label
+
+
+def _endpoint_kind(ep: FlowEndpoint) -> str:
+    """노드 성격: reserved(예약 개체) | infra(시스템 ns) | app(사용자 앱). 다이어그램 표기/색 구분용."""
+    if ep.namespace is None:
+        return "reserved"
+    return "infra" if ep.namespace in SYSTEM_NAMESPACES else "app"
+
+
+def _assign_layers(edges: List[tuple]) -> Dict[str, int]:
+    """(src,dst) 방향 그래프에서 각 노드의 계층(진입점으로부터의 최장 홉 수)을 매긴다.
+
+    들어오는 간선이 없는 진입점이 layer 0, 거기서 k홉 떨어진 노드가 layer k. 이렇게 하면
+    A→B→C 처럼 '다음 단계로 이어지는' 흐름이 왼→오 계층으로 펼쳐진다(1:1 쌍은 인접 계층).
+    Cilium 흐름엔 양방향/순환이 섞일 수 있으므로, 완화(relaxation)를 노드 수만큼만 반복해
+    순환에서도 무한루프 없이 유한한 계층으로 수렴시킨다(자기 자신으로의 간선은 무시).
+    """
+    adj: Dict[str, set] = defaultdict(set)
+    nodes: set = set()
+    for src, dst in edges:
+        nodes.add(src)
+        nodes.add(dst)
+        if src != dst:
+            adj[src].add(dst)
+    layer = {n: 0 for n in nodes}
+    for _ in range(len(nodes)):
+        changed = False
+        for src in nodes:
+            base = layer[src] + 1
+            for dst in adj[src]:
+                if layer[dst] < base:
+                    layer[dst] = base
+                    changed = True
+        if not changed:
+            break
+    # 사용된 계층 값을 0..k-1 연속값으로 압축한다 — 순환 등으로 생긴 빈 계층을 없애 열 수를 줄인다.
+    rank = {v: i for i, v in enumerate(sorted(set(layer.values())))}
+    return {n: rank[v] for n, v in layer.items()}
 
 
 def summarize(
@@ -140,6 +180,16 @@ def summarize(
     pair_counts: Counter = Counter()
     pair_last_seen: Dict[tuple, str] = {}
     pair_verdicts: Dict[tuple, Counter] = defaultdict(Counter)
+    # 노드별 리소스 메타(네임스페이스/워크로드/성격) — "흐름에 쓰이는 리소스"를 함께 보여주기 위함.
+    node_meta: Dict[str, dict] = {}
+
+    def _note(ep: FlowEndpoint) -> None:
+        meta = node_meta.setdefault(
+            ep.label,
+            {"namespace": ep.namespace, "workload": ep.workload, "kind": _endpoint_kind(ep)},
+        )
+        if meta["workload"] is None and ep.workload:  # 워크로드는 뒤늦게 관측될 수 있으니 채워준다.
+            meta["workload"] = ep.workload
 
     for ev in selected:
         verdicts[ev.verdict] += 1
@@ -147,6 +197,8 @@ def summarize(
         pair_counts[key] += 1
         pair_verdicts[key][ev.verdict] += 1
         pair_last_seen[key] = ev.time  # 뒤에서부터 덮어써도 마지막 관측 시각으로 수렴
+        _note(ev.src)
+        _note(ev.dst)
 
     top_pairs = [
         {
@@ -159,6 +211,19 @@ def summarize(
         for (src, dst, proto, port), count in pair_counts.most_common(top_n)
     ]
 
+    # top_pairs(그려질 간선)를 방향 그래프로 보고 노드에 계층을 매긴다 → 멀티홉 흐름을 펼쳐 그림.
+    layers = _assign_layers([(p["src"], p["dst"]) for p in top_pairs])
+    nodes = [
+        {
+            "label": label,
+            "namespace": node_meta.get(label, {}).get("namespace"),
+            "workload": node_meta.get(label, {}).get("workload"),
+            "kind": node_meta.get(label, {}).get("kind", "app"),
+            "layer": layers[label],
+        }
+        for label in sorted(layers, key=lambda n: (layers[n], n))
+    ]
+
     return FlowSummary(
         total=total,
         shown=len(selected),
@@ -169,6 +234,7 @@ def summarize(
         namespaces=namespaces,
         verdicts=dict(verdicts),
         top_pairs=top_pairs,
+        nodes=nodes,
     )
 
 

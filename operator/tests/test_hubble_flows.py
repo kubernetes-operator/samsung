@@ -15,9 +15,14 @@ from k8s_traffic_operator.hubble_client import _parse_flow_line
 
 
 def _flow_line(*, verdict="FORWARDED", dst_pod="cart-def", dst_ns="shop",
-               src_pod="checkout-abc", src_ns="shop", src_reserved=None, dst_reserved=None) -> str:
+               src_pod="checkout-abc", src_ns="shop", src_reserved=None, dst_reserved=None,
+               src_wl=None, dst_wl=None) -> str:
     src = {"labels": [f"reserved:{src_reserved}"]} if src_reserved else {"namespace": src_ns, "pod_name": src_pod}
     dst = {"labels": [f"reserved:{dst_reserved}"]} if dst_reserved else {"namespace": dst_ns, "pod_name": dst_pod}
+    if src_wl and not src_reserved:
+        src["workloads"] = [{"name": src_wl}]
+    if dst_wl and not dst_reserved:
+        dst["workloads"] = [{"name": dst_wl}]
     return json.dumps({
         "flow": {
             "time": "2026-07-19T12:00:00.000000000Z",
@@ -247,3 +252,65 @@ def test_fetch_summary_fetch_error_preserves_filters(monkeypatch):
     summary = hf.fetch_summary(scope="all", namespace="shop", focus="shop/x")
     assert summary.fetch_error is not None
     assert (summary.scope, summary.namespace, summary.focus) == ("all", "shop", "shop/x")
+
+
+# --------------------------------------------------------------------------- 멀티홉 계층(_assign_layers)
+def test_assign_layers_linear_chain():
+    """A→B→C 사슬은 계층 0,1,2로 펼쳐져야 한다(다음 단계 흐름)."""
+    layers = hf._assign_layers([("A", "B"), ("B", "C")])
+    assert layers == {"A": 0, "B": 1, "C": 2}
+
+
+def test_assign_layers_entry_point_is_layer_zero():
+    """들어오는 간선이 없는 노드(진입점)가 여럿을 향해도 그 자신은 layer 0."""
+    layers = hf._assign_layers([("gw", "a"), ("gw", "b"), ("a", "b")])
+    assert layers["gw"] == 0
+    assert layers["a"] == 1
+    assert layers["b"] == 2  # gw→b(1)보다 a→b(2)가 더 길어 최장 홉 = 2
+
+
+def test_assign_layers_cycle_terminates_and_is_bounded():
+    """순환(A→B→A)이 있어도 무한루프 없이 유한 계층을 낸다."""
+    layers = hf._assign_layers([("A", "B"), ("B", "A")])
+    assert set(layers) == {"A", "B"}
+    assert all(0 <= v < 2 for v in layers.values())  # 노드 수(2) 이내로 bound
+
+
+def test_assign_layers_ignores_self_loop():
+    layers = hf._assign_layers([("A", "A")])
+    assert layers == {"A": 0}
+
+
+# --------------------------------------------------------------------------- summarize가 만드는 노드 그래프
+def test_summarize_builds_layered_nodes_for_chain():
+    """A→B, B→C 흐름 → nodes에 3개 리소스가 계층과 함께 담긴다."""
+    events = [
+        _ev(src_pod="a", src_ns="shop", dst_pod="b", dst_ns="shop"),
+        _ev(src_pod="b", src_ns="shop", dst_pod="c", dst_ns="shop"),
+    ]
+    summary = hf.summarize(events)
+    layer_by = {n["label"]: n["layer"] for n in summary.nodes}
+    assert layer_by == {"shop/a": 0, "shop/b": 1, "shop/c": 2}
+
+
+def test_summarize_nodes_carry_workload_and_kind():
+    """노드에 워크로드/성격 메타가 실려야 한다('흐름에 쓰이는 리소스' 표기용)."""
+    events = [_ev(src_pod="checkout-abc", src_ns="shop", src_wl="checkout",
+                  dst_pod="cart-def", dst_ns="shop", dst_wl="cart")]
+    summary = hf.summarize(events)
+    meta = {n["label"]: n for n in summary.nodes}
+    assert meta["shop/checkout-abc"]["workload"] == "checkout"
+    assert meta["shop/checkout-abc"]["kind"] == "app"
+    assert meta["shop/cart-def"]["workload"] == "cart"
+
+
+def test_summarize_node_kind_infra_and_reserved():
+    events = [
+        _ev(src_ns="shop", dst_ns="kube-system", dst_pod="coredns"),   # dst = 인프라 ns
+        _ev(src_reserved="world", dst_ns="shop", dst_pod="web"),        # src = 예약 개체
+    ]
+    summary = hf.summarize(events, scope="all")
+    kind = {n["label"]: n["kind"] for n in summary.nodes}
+    assert kind["kube-system/coredns"] == "infra"
+    assert kind["world"] == "reserved"
+    assert kind["shop/web"] == "app"

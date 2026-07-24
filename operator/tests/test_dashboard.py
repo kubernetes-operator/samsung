@@ -347,22 +347,79 @@ def test_flows_page_renders_inline_svg_diagram_when_data(monkeypatch):
     assert "shop/cart-def" in text                   # destination 노드 라벨
 
 
-def test_flow_diagram_svg_empty_for_no_pairs():
-    assert dashboard_app._flow_diagram_svg([]) == ""
+def test_flow_graph_svg_empty_for_no_edges():
+    assert dashboard_app._flow_graph_svg([], []) == ""
 
 
-def test_flow_diagram_svg_limits_to_top_n():
-    """다이어그램은 가독성을 위해 상위 N개만 그린다(표에는 전체가 있음)."""
-    pairs = [
+def test_flow_graph_svg_limits_to_top_n():
+    """그래프는 가독성을 위해 상위 N개 간선만 그린다(표에는 전체가 있음). 노드는 합성 가능."""
+    edges = [
         {"src": f"ns/src-{i}", "dst": f"ns/dst-{i}", "protocol": "TCP",
          "dst_port": 80, "count": 100 - i, "verdict": "FORWARDED",
          "last_seen": "2026-07-19T12:00:00Z"}
         for i in range(20)
     ]
-    svg = dashboard_app._flow_diagram_svg(pairs, limit=10)
-    # 상위 10개 source만 노드로 그려진다 — 11번째는 없어야 한다.
+    svg = dashboard_app._flow_graph_svg([], edges, limit=10)  # nodes 비어도 합성됨
+    # 상위 10개 간선의 노드만 그려진다 — 11번째는 없어야 한다.
     assert "ns/src-9" in svg
     assert "ns/src-10" not in svg
+
+
+def test_flow_graph_svg_renders_multihop_chain():
+    """A→B→C 사슬: 중간 노드 B는 한 번만 그려지고, 두 간선 모두 존재해야 한다(다음 단계 흐름)."""
+    nodes = [
+        {"label": "shop/a", "namespace": "shop", "workload": "front", "kind": "app", "layer": 0},
+        {"label": "shop/b", "namespace": "shop", "workload": "mid", "kind": "app", "layer": 1},
+        {"label": "shop/c", "namespace": "shop", "workload": "back", "kind": "app", "layer": 2},
+    ]
+    edges = [
+        {"src": "shop/a", "dst": "shop/b", "protocol": "TCP", "dst_port": 80, "count": 5, "verdict": "FORWARDED"},
+        {"src": "shop/b", "dst": "shop/c", "protocol": "TCP", "dst_port": 90, "count": 3, "verdict": "FORWARDED"},
+    ]
+    svg = dashboard_app._flow_graph_svg(nodes, edges)
+    assert svg.count("shop/b</text>") == 1          # 중간 노드는 한 번만 (사슬로 이어짐)
+    assert svg.count("marker-end") == 2             # 간선 두 개
+    # 워크로드(리소스)가 칩 아랫줄에 표시된다.
+    assert "▸ front" in svg and "▸ mid" in svg and "▸ back" in svg
+
+
+def test_flow_graph_svg_nodes_are_focus_links():
+    nodes = [{"label": "shop/a", "namespace": "shop", "workload": None, "kind": "app", "layer": 0}]
+    edges = [{"src": "shop/a", "dst": "shop/b", "protocol": "TCP", "dst_port": 80,
+              "count": 1, "verdict": "FORWARDED"}]
+    svg = dashboard_app._flow_graph_svg(nodes, edges)
+    assert "focus=shop%2Fa" in svg and "focus=shop%2Fb" in svg
+
+
+def test_flows_page_renders_multihop_graph_with_resources(monkeypatch):
+    """페이지 렌더에 summary.nodes(계층/워크로드)가 그래프로 반영되는지 end-to-end로 확인."""
+    summary = FlowSummary(
+        total=3, shown=3, app_flows=3, verdicts={"FORWARDED": 3},
+        top_pairs=[
+            {"src": "shop/a", "dst": "shop/b", "protocol": "TCP", "dst_port": 80, "count": 3, "verdict": "FORWARDED", "last_seen": "2026-07-23T12:00:00Z"},
+            {"src": "shop/b", "dst": "shop/c", "protocol": "TCP", "dst_port": 90, "count": 2, "verdict": "FORWARDED", "last_seen": "2026-07-23T12:00:00Z"},
+        ],
+        nodes=[
+            {"label": "shop/a", "namespace": "shop", "workload": "front", "kind": "app", "layer": 0},
+            {"label": "shop/b", "namespace": "shop", "workload": "mid", "kind": "app", "layer": 1},
+            {"label": "shop/c", "namespace": "shop", "workload": "back", "kind": "app", "layer": 2},
+        ],
+    )
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    text = _authed_client().get("/flows").text
+    assert "다음 단계" in text                 # 멀티홉 설명/캡션
+    assert "▸ mid" in text                      # 중간 노드의 워크로드(리소스)
+    assert text.count("shop/b</text>") == 1     # 중간 노드는 한 번만
+
+
+def test_api_flows_includes_nodes(monkeypatch):
+    summary = FlowSummary(total=1, shown=1, app_flows=1, verdicts={"FORWARDED": 1},
+        top_pairs=[{"src": "shop/a", "dst": "shop/b", "protocol": "TCP", "dst_port": 80, "count": 1, "verdict": "FORWARDED", "last_seen": "t"}],
+        nodes=[{"label": "shop/a", "namespace": "shop", "workload": "front", "kind": "app", "layer": 0}])
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
+    payload = _authed_client().get("/api/flows").json()
+    assert payload["nodes"][0]["workload"] == "front"
+    assert payload["nodes"][0]["layer"] == 0
 
 
 # --------------------------------------------------------------------------- namespace 필터 + focus(연결 리소스)
