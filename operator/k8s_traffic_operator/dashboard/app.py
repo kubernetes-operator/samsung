@@ -3,10 +3,11 @@
 실행:
     uvicorn k8s_traffic_operator.dashboard.app:app --host 0.0.0.0 --port 8080
 
-- `GET /`             : TrafficPolicy 현황 HTML (10초마다 자동 새로고침)
-- `GET /api/policies` : 동일 데이터의 JSON
-- `GET /flows`        : Cilium Hubble 기반 실제 Pod 트래픽 흐름 HTML
-- `GET /api/flows`    : 동일 데이터의 JSON
+- `GET /`             : 메인 화면 = Cilium Hubble 기반 실제 Pod 트래픽 흐름 HTML (10초마다 자동 새로고침)
+- `GET /flows`        : 위와 동일한 트래픽 흐름 HTML (예전 링크 호환용 별칭)
+- `GET /policies`     : TrafficPolicy 현황 HTML (메뉴바의 '정책 현황')
+- `GET /api/flows`    : 트래픽 흐름 데이터의 JSON
+- `GET /api/policies` : 정책 현황 데이터의 JSON
 - `GET /healthz`      : liveness/readiness 프로브용
 
 `/`와 `/flows`는 서로 다른 성격의 데이터다. `/`는 오퍼레이터가 판단한 정책 상태(Gateway API
@@ -113,10 +114,19 @@ _STYLE = """
          background: #0b0d12; color: #e5e7eb; }
   @media (prefers-color-scheme: light) { body { background: #f8fafc; color: #111827; } }
   h1 { font-size: 1.25rem; margin-bottom: .25rem; }
-  nav { margin-bottom: 1rem; font-size: .85rem; }
-  nav a { color: #60a5fa; text-decoration: none; margin-right: 1rem; }
   a { color: #60a5fa; }
   a.active { color: inherit; font-weight: 600; text-decoration: underline; }
+  /* 상단 메뉴바: 브랜드(좌) + 탭 메뉴. sticky로 스크롤해도 상단에 고정. */
+  .topbar { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1.25rem;
+            padding: .55rem .9rem; margin-bottom: 1.25rem; border-radius: .6rem;
+            background: rgba(148,163,184,.12); border: 1px solid rgba(148,163,184,.22);
+            position: sticky; top: .5rem; z-index: 10; backdrop-filter: blur(6px); }
+  .topbar .brand { font-weight: 700; font-size: .95rem; margin-right: auto; }
+  .menu { display: flex; gap: .35rem; }
+  .menu a { color: #9ca3af; text-decoration: none; padding: .35rem .8rem; border-radius: .45rem;
+            font-size: .9rem; white-space: nowrap; }
+  .menu a:hover { background: rgba(148,163,184,.16); color: inherit; }
+  .menu a.active { background: #2563eb; color: #fff; font-weight: 600; text-decoration: none; }
   .meta { color: #9ca3af; font-size: .85rem; margin-bottom: 1.5rem; }
   table { width: 100%; border-collapse: collapse; font-size: .9rem; }
   th { text-align: left; padding: .5rem .75rem; border-bottom: 2px solid #374151; color: #9ca3af;
@@ -149,10 +159,13 @@ _PAGE_TEMPLATE = """<!doctype html>
 <style>{style}</style>
 </head>
 <body>
-<nav>
-  <a href="{prefix}/" class="{nav_policies}">TrafficPolicy 현황</a>
-  <a href="{prefix}/flows" class="{nav_flows}">실시간 Pod 트래픽 흐름 (Hubble)</a>
-</nav>
+<header class="topbar">
+  <span class="brand">TrafficPolicy 대시보드</span>
+  <nav class="menu">
+    <a href="{prefix}/" class="{nav_flows}">🌐 트래픽 흐름</a>
+    <a href="{prefix}/policies" class="{nav_policies}">📋 정책 현황</a>
+  </nav>
+</header>
 <h1>{heading}</h1>
 <div class="meta">{meta}</div>
 {table}
@@ -175,8 +188,9 @@ def _url_prefix() -> str:
 
 
 def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
-    """/flows 링크를 프리픽스 + 현재 필터(scope/namespace/focus)를 담은 URL로 만든다.
+    """트래픽 흐름(메인) 링크를 프리픽스 + 현재 필터(scope/namespace/focus)를 담은 URL로 만든다.
 
+    트래픽 흐름이 메인 화면('/')이므로 루트 기준으로 URL을 만든다(레거시 '/flows'도 동일 내용).
     필터끼리 서로를 지우지 않고 조합되도록, 각 UI 요소가 유지할 값만 넘겨 호출한다
     (예: 네임스페이스 링크는 focus를 안 넘겨 초기화, 리소스 클릭은 namespace를 유지).
     값은 urlencode로 이스케이프되며, 라벨의 '/'(ns/pod)도 %2F로 안전하게 인코딩된다.
@@ -186,7 +200,7 @@ def _flows_url(*, scope: str, namespace: Optional[str] = None, focus: Optional[s
         query["namespace"] = namespace
     if focus:
         query["focus"] = focus
-    return f"{_url_prefix()}/flows?{urlencode(query)}"
+    return f"{_url_prefix()}/?{urlencode(query)}"
 
 
 def _clean_param(value: Optional[str], max_len: int = 512) -> Optional[str]:
@@ -660,8 +674,29 @@ def _normalize_scope(scope: str) -> str:
     return "all" if scope == "all" else "app"
 
 
+def _flows_response(scope: str, namespace: Optional[str], focus: Optional[str]) -> str:
+    return _render_flows(hubble_flows.fetch_summary(
+        scope=_normalize_scope(scope),
+        namespace=_clean_param(namespace),
+        focus=_clean_param(focus),
+    ))
+
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
+def dashboard(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+    """메인 화면 = 실시간 트래픽 흐름(Hubble)."""
+    return _flows_response(scope, namespace, focus)
+
+
+@app.get("/flows", response_class=HTMLResponse)
+def flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
+    """레거시 별칭 — 예전 '/flows' 북마크/링크 호환용. 메인('/')과 동일한 내용."""
+    return _flows_response(scope, namespace, focus)
+
+
+@app.get("/policies", response_class=HTMLResponse)
+def policies_page() -> str:
+    """TrafficPolicy 정책 현황(오퍼레이터 판단 결과). 메뉴바의 '정책 현황'."""
     return _render_policies(data.fetch_policies())
 
 
@@ -673,15 +708,6 @@ def api_policies():
         "count": len(policies),
         "policies": [p.__dict__ for p in policies],
     }
-
-
-@app.get("/flows", response_class=HTMLResponse)
-def flows(scope: str = "app", namespace: Optional[str] = None, focus: Optional[str] = None) -> str:
-    return _render_flows(hubble_flows.fetch_summary(
-        scope=_normalize_scope(scope),
-        namespace=_clean_param(namespace),
-        focus=_clean_param(focus),
-    ))
 
 
 @app.get("/api/flows", response_class=JSONResponse)

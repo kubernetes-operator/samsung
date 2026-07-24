@@ -174,18 +174,18 @@ def test_healthz():
     assert resp.json() == {"status": "ok"}
 
 
-def test_root_returns_html_table(client_with_policies):
-    resp = client_with_policies.get("/")
+def test_policies_page_returns_html_table(client_with_policies):
+    resp = client_with_policies.get("/policies")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "checkout-policy" in resp.text
     assert "<table>" in resp.text
 
 
-def test_root_shows_empty_state_when_no_policies(monkeypatch):
+def test_policies_page_shows_empty_state_when_no_policies(monkeypatch):
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
     client = _authed_client()
-    resp = client.get("/")
+    resp = client.get("/policies")
     assert resp.status_code == 200
     assert "없습니다" in resp.text
 
@@ -204,7 +204,7 @@ def test_html_escapes_untrusted_reason_field(monkeypatch):
     malicious = _cr(reason='<script>alert(1)</script>')
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [data._summarize(malicious, time.time())])
     client = _authed_client()
-    resp = client.get("/")
+    resp = client.get("/policies")
     assert "<script>alert(1)</script>" not in resp.text
     assert "&lt;script&gt;" in resp.text
 
@@ -213,7 +213,7 @@ def test_error_row_rendered_for_fetch_failure(monkeypatch):
     err_summary = data.PolicySummary(namespace="shop", name="(조회 실패)", phase="Error", raw_error="권한 없음: 403")
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [err_summary])
     client = _authed_client()
-    resp = client.get("/")
+    resp = client.get("/policies")
     assert "권한 없음" in resp.text
 
 
@@ -280,12 +280,37 @@ def test_flows_html_escapes_pod_names_for_xss(monkeypatch):
     assert "&lt;script&gt;" in resp.text
 
 
-def test_nav_links_present_on_both_pages(monkeypatch):
+def test_menu_bar_present_on_both_pages(monkeypatch):
+    """메뉴바(브랜드 + 트래픽 흐름/정책 현황 탭)가 두 페이지 모두에 있어야 한다."""
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: FlowSummary(total=0))
     client = _authed_client()
-    assert 'href="/flows"' in client.get("/").text
-    assert 'href="/"' in client.get("/flows").text
+    for path in ("/", "/policies"):
+        text = client.get(path).text
+        assert 'class="topbar"' in text                 # 메뉴바 컨테이너
+        assert 'href="/" class="active"' in text or 'href="/"' in text  # 트래픽 흐름(메인)
+        assert 'href="/policies"' in text               # 정책 현황
+        assert "트래픽 흐름" in text and "정책 현황" in text
+
+
+def test_main_page_is_traffic_flows(monkeypatch):
+    """메인('/')은 정책이 아니라 트래픽 흐름 화면이어야 한다."""
+    monkeypatch.setattr(
+        dashboard_app.hubble_flows, "fetch_summary",
+        lambda **kw: FlowSummary(total=0, shown=0, scope="app"),
+    )
+    text = _authed_client().get("/").text
+    assert "Hubble" in text                       # 흐름 페이지 설명 패널
+    assert 'class="menu"' in text
+    # 메뉴바의 '트래픽 흐름' 탭이 활성 표시.
+    assert 'href="/" class="active"' in text
+
+
+def test_flows_alias_still_works(monkeypatch):
+    """예전 '/flows' 링크도 동일한 흐름 화면을 계속 보여줘야 한다(하위호환)."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    assert "Hubble" in _authed_client().get("/flows").text
 
 
 def test_links_use_external_prefix_when_configured(monkeypatch):
@@ -299,14 +324,14 @@ def test_links_use_external_prefix_when_configured(monkeypatch):
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: FlowSummary(total=0))
     client = _authed_client()
 
+    # 메뉴바 링크가 프리픽스를 포함해야 한다(트래픽 흐름=루트, 정책 현황=/policies).
     root_html = client.get("/").text
     assert 'href="/traffic-dashboard/"' in root_html
-    assert 'href="/traffic-dashboard/flows"' in root_html
+    assert 'href="/traffic-dashboard/policies"' in root_html
 
-    flows_html = client.get("/flows").text
-    # 스코프 토글 링크도 프리픽스를 포함해야 한다.
-    assert 'href="/traffic-dashboard/flows?scope=app"' in flows_html
-    assert 'href="/traffic-dashboard/flows?scope=all"' in flows_html
+    # 스코프 토글 등 흐름 필터 링크도 프리픽스를 포함하고, 메인(루트) 기준이어야 한다.
+    assert 'href="/traffic-dashboard/?scope=app"' in root_html
+    assert 'href="/traffic-dashboard/?scope=all"' in root_html
 
 
 def test_prefix_is_stripped_and_normalized(monkeypatch):
@@ -460,10 +485,10 @@ def test_flows_page_shows_namespace_filter_links(monkeypatch):
     """네임스페이스 목록이 선택 링크로 렌더되고, 각 링크는 scope를 유지한 /flows URL이어야 한다."""
     summary = _flows_summary(namespaces=[{"name": "shop", "count": 5}, {"name": "pay", "count": 2}])
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    text = _authed_client().get("/flows").text
+    text = _authed_client().get("/").text
     assert "네임스페이스:" in text
-    assert 'href="/flows?scope=app&amp;namespace=shop"' in text
-    assert 'href="/flows?scope=app&amp;namespace=pay"' in text
+    assert 'href="/?scope=app&amp;namespace=shop"' in text
+    assert 'href="/?scope=app&amp;namespace=pay"' in text
     assert ">shop</a>" in text and "(5)" in text
 
 
@@ -487,11 +512,11 @@ def test_flows_focus_banner_and_clear_link(monkeypatch):
     """focus가 걸리면 배너 + 해제 링크(focus 없는 URL)를 보여준다."""
     summary = _flows_summary(focus="shop/checkout-abc", namespace="shop")
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary", lambda **kw: summary)
-    text = _authed_client().get("/flows").text
+    text = _authed_client().get("/").text
     assert "shop/checkout-abc" in text
     assert "선택 해제" in text
-    # 해제 링크는 scope/namespace는 유지하되 focus는 빠진다.
-    assert 'href="/flows?scope=app&amp;namespace=shop"' in text
+    # 해제 링크는 scope/namespace는 유지하되 focus는 빠진다(메인=루트 기준).
+    assert 'href="/?scope=app&amp;namespace=shop"' in text
 
 
 def test_flows_scope_toggle_preserves_namespace_and_focus(monkeypatch):
@@ -582,7 +607,7 @@ def test_malformed_authorization_header_rejected(monkeypatch):
 
 def test_valid_credentials_allowed(monkeypatch):
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
-    resp = _authed_client().get("/")
+    resp = _authed_client().get("/policies")
     assert resp.status_code == 200
 
 
