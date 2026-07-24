@@ -84,16 +84,24 @@ def _refresh_meta_tag() -> str:
 
 
 def _refresh_selector_html(option_url) -> str:
-    """자동 새로고침 선택 컨트롤. `option_url(value)`가 각 옵션의 링크 URL을 만든다."""
+    """자동 새로고침 선택 컨트롤(상단바). 셀 형태 **세그먼트 버튼**으로 현재 선택을 강조한다.
+
+    `option_url(value)`가 각 옵션의 링크 URL을 만든다(무JS — meta refresh + 링크 이동).
+    """
     cur = _refresh_var.get()
-    parts = [
-        f'<a href="{html.escape(option_url(val))}" class="{"active" if val == cur else ""}">'
-        f"{html.escape(label)}</a>"
-        for val, label in _REFRESH_OPTIONS
-    ]
+    cells = []
+    for val, label in _REFRESH_OPTIONS:
+        active = val == cur
+        cls = "seg active" if active else "seg"
+        cur_attr = ' aria-current="true"' if active else ""
+        cells.append(
+            f'<a href="{html.escape(option_url(val))}" class="{cls}"{cur_attr}>'
+            f"{html.escape(label)}</a>"
+        )
     return (
-        '<div class="refresh-ctl" style="margin-bottom:.75rem;font-size:.85rem">'
-        "자동 새로고침: " + " · ".join(parts) + "</div>"
+        '<div class="refresh-seg" role="group" aria-label="자동 새로고침 주기">'
+        '<span class="refresh-seg-label">자동 새로고침</span>'
+        '<span class="seg-cells">' + "".join(cells) + "</span></div>"
     )
 
 
@@ -204,6 +212,17 @@ _STYLE = """
          padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 14px; text-decoration: none; }
   .tab:hover { color: var(--fg); }
   .tab.active { background: var(--card-bg); color: var(--fg); border-color: var(--border); }
+  /* 상단바 우측 그룹: 자동 새로고침 세그먼트 + 로그인 박스. */
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  /* 자동 새로고침 = 셀 형태 세그먼트 버튼(현재 선택 강조). 무JS 링크(meta refresh + 이동). */
+  .refresh-seg { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .refresh-seg-label { color: var(--muted); white-space: nowrap; }
+  .seg-cells { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg { padding: 4px 10px; color: var(--muted); text-decoration: none; white-space: nowrap;
+         border-left: 1px solid var(--border); }
+  .seg:first-child { border-left: none; }
+  .seg:hover { color: var(--fg); background: var(--card-bg); }
+  .seg.active { background: var(--info); color: #fff; font-weight: 600; }
   main { padding: 20px; max-width: 1100px; margin: 0 auto; }
   h2.page-title { font-size: 18px; margin: 0 0 4px; }
   a.active { color: inherit; font-weight: 600; text-decoration: underline; }
@@ -273,12 +292,11 @@ _PAGE_TEMPLATE = """<!doctype html>
     <a href="{prefix}/" class="tab {nav_flows}">트래픽 흐름</a>
     <a href="{prefix}/policies" class="tab {nav_policies}">정책 현황</a>
   </nav>
-  {userbox}
+  <div class="topbar-right">{refresh}{userbox}</div>
 </header>
 <main>
   <h2 class="page-title">{heading}</h2>
   <div class="meta">{meta}</div>
-  {refresh}
   {table}
 </main>
 </body>

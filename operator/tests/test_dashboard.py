@@ -352,9 +352,20 @@ def test_default_refresh_is_one_minute(monkeypatch):
 
 def test_refresh_selector_has_all_five_options(monkeypatch):
     text = _flows_client(monkeypatch).get("/").text
-    assert 'class="refresh-ctl"' in text
+    assert 'class="refresh-seg"' in text            # 셀 형태 세그먼트 버튼
     for label in ("10초", "30초", "1분", "10분", "안 함"):
         assert label in text
+
+
+def test_refresh_selector_is_in_topbar(monkeypatch):
+    """자동 새로고침 컨트롤은 본문이 아니라 상단바(.topbar-right) 안에 있어야 한다."""
+    text = _flows_client(monkeypatch).get("/").text
+    topbar = text.split('<header class="topbar">')[1].split("</header>")[0]
+    body = text.split("</header>")[1]
+    assert 'class="refresh-seg"' in topbar          # 상단바 안에 존재
+    assert "refresh-seg" not in body                # 본문에는 없음
+    # 현재 선택(기본 1분)이 active 셀로 강조되어야 한다.
+    assert 'class="seg active"' in text and 'aria-current="true"' in text
 
 
 def test_refresh_override_changes_meta(monkeypatch):
