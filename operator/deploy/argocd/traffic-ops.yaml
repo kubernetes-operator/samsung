@@ -1,0 +1,53 @@
+# ArgoCD Application — k8s-traffic-operator 전체 스택(GitOps).
+#
+# 이 클러스터는 배포를 ArgoCD로 한다(seoul/seongnam과 동일 관례). 이 Application 하나가
+# operator/deploy/k8s 디렉터리의 매니페스트 전부를 동기화한다:
+#   00-crd.yaml       TrafficPolicy CRD (cluster-scoped)
+#   10-operator.yaml  오퍼레이터 본체 (traffic-ops-system ns) + ClusterRole/Binding
+#   20-dashboard.yaml 읽기전용 대시보드 (traffic-policy-dashboard ns) + Service/HTTPRoute
+#   21-...secret...template  대시보드 Basic 인증 Secret 예시(확장자 .template → 동기화 안 됨)
+#
+# 배포/갱신 흐름(GitOps):
+#   1) 코드 변경 → 새 **버전 태그**로 이미지 빌드·푸시(:latest 아님)
+#   2) 10/20-*.yaml 의 image 태그를 올려 커밋·push
+#   3) ArgoCD가 main을 감지해 자동 동기화(automated: prune + selfHeal)
+# selfHeal이 켜져 있어 수동 kubectl 변경은 git 상태로 되돌려진다(git이 유일한 진실).
+#
+# 대시보드 인증 Secret(traffic-policy-dashboard-auth)은 git에 없고 배포자가 직접 만든다
+# (21-...template 참고). ArgoCD는 그 Secret을 추적/프룬하지 않는다.
+#
+# 적용: kubectl apply -f operator/deploy/argocd/traffic-ops.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: traffic-ops
+  namespace: argocd
+  # 앱이 실수로 지워질 때 리소스까지 정리되도록 finalizer 부여(ArgoCD 표준).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kubernetes-operator/samsung.git
+    targetRevision: main
+    path: operator/deploy/k8s
+    directory:
+      recurse: false      # k8s 디렉터리 바로 아래 매니페스트만(하위 디렉터리 없음)
+  destination:
+    server: https://kubernetes.default.svc
+    # 네임스페이스 미지정 리소스의 기본값. 실제 리소스는 각자 metadata.namespace를 가지며
+    # Namespace 오브젝트도 매니페스트에 포함되어 있다(CreateNamespace에 의존하지 않음).
+    namespace: traffic-ops-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

@@ -8,10 +8,11 @@
 # 특정 네임스페이스만 보고 싶으면 Deployment의 WATCH_NAMESPACE 값을 채우고,
 # 아래 ClusterRole/ClusterRoleBinding을 그 네임스페이스의 Role/RoleBinding으로 좁혀도 된다.
 #
-# 이미지 빌드/푸시: docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
-#                  docker push <registry>/traffic-policy-dashboard:latest
+# 이미지 빌드/푸시(GitOps: :latest 대신 버전 태그 사용 — 태그를 올려야 ArgoCD가 재배포):
+#   docker build -f Dockerfile.dashboard -t registry.local.cloud:5000/traffic-policy-dashboard:v0.1.0 .
+#   docker push registry.local.cloud:5000/traffic-policy-dashboard:v0.1.0
+# 코드/프론트 변경 시: 새 버전으로 빌드·푸시하고 아래 image 태그를 올린 뒤 커밋 → ArgoCD가 자동 동기화.
 # 아래 image 값은 이 클러스터에 실제로 연결된 내부 레지스트리(registry.local.cloud:5000) 기준이다.
-# 다른 환경에 배포한다면 image 값을 그 환경의 레지스트리로 바꿀 것.
 
 apiVersion: v1
 kind: Namespace
@@ -64,7 +65,7 @@ spec:
       serviceAccountName: traffic-policy-dashboard
       containers:
         - name: dashboard
-          image: registry.local.cloud:5000/traffic-policy-dashboard:latest
+          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.0
           ports:
             - containerPort: 8080
           env:

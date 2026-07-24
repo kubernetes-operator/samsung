@@ -9,9 +9,10 @@
 # 권한(Deployment scale, HTTPRoute weight)은 각 CR의 target에 실제로 명시된 리소스에만
 # 적용된다(actuator는 CR의 spec.target 밖의 리소스는 절대 건드리지 않는다).
 #
-# 이미지 빌드/푸시:
-#   docker build -t registry.local.cloud:5000/k8s-traffic-operator:latest .
-#   docker push registry.local.cloud:5000/k8s-traffic-operator:latest
+# 이미지 빌드/푸시(GitOps: :latest 대신 버전 태그 사용 — 태그를 올려야 ArgoCD가 재배포):
+#   docker build -t registry.local.cloud:5000/k8s-traffic-operator:v0.1.0 -f Dockerfile .
+#   docker push registry.local.cloud:5000/k8s-traffic-operator:v0.1.0
+# 코드 변경 시: 새 버전으로 빌드·푸시하고 아래 image 태그를 올린 뒤 커밋 → ArgoCD가 자동 동기화.
 
 apiVersion: v1
 kind: Namespace
@@ -86,7 +87,7 @@ spec:
       serviceAccountName: traffic-operator
       containers:
         - name: operator
-          image: registry.local.cloud:5000/k8s-traffic-operator:latest
+          image: registry.local.cloud:5000/k8s-traffic-operator:v0.1.0
           env:
             - name: GATEWAY_IMPLEMENTATION
               value: "cilium-hubble"

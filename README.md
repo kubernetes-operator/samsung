@@ -31,10 +31,14 @@ operator/
 │   ├── actuator/                   # Deployment 스케일 + HTTPRoute weight 실행기
 │   └── dashboard/                  # 읽기 전용 웹 대시보드 (별도 프로세스)
 ├── Dockerfile                      # 오퍼레이터 본체 이미지
-├── deploy/operator.yaml            # 오퍼레이터 배포 매니페스트 (ClusterRole/Deployment, 클러스터 전역 감시)
-├── deploy/dashboard.yaml           # 대시보드 배포 매니페스트 (ServiceAccount/RBAC/Deployment/Service)
 ├── Dockerfile.dashboard
-└── tests/                          # pytest 회귀 테스트 (168개)
+├── deploy/k8s/                     # ArgoCD가 동기화하는 GitOps 매니페스트(단일 소스 디렉터리)
+│   ├── 00-crd.yaml                 #   CRD 배포용 사본(원본은 crds/trafficpolicy.yaml)
+│   ├── 10-operator.yaml            #   오퍼레이터 본체 (ClusterRole/Deployment, 전역 감시)
+│   ├── 20-dashboard.yaml           #   대시보드 (SA/RBAC/Deployment/Service/HTTPRoute)
+│   └── 21-...secret...template     #   대시보드 Basic 인증 Secret 예시(.template → 미동기화)
+├── deploy/argocd/traffic-ops.yaml  # ArgoCD Application(위 디렉터리를 main에서 동기화)
+└── tests/                          # pytest 회귀 테스트 (220개)
 ```
 
 ## 시작하기
@@ -47,19 +51,36 @@ python3 -m venv .venv
 # 테스트 실행
 ./.venv/bin/pytest
 
-# CRD 설치 (클러스터 대상)
-kubectl apply -f crds/trafficpolicy.yaml
-
 # 로컬 실행 (operator/ 디렉토리에서, 모듈 모드)
 ./.venv/bin/kopf run -m k8s_traffic_operator.main --verbose
-
-# 클러스터에 상시 배포 (이미지 빌드/푸시 후 deploy/operator.yaml의 <registry> 값 교체)
-docker build -t <registry>/k8s-traffic-operator:latest .
-docker push <registry>/k8s-traffic-operator:latest
-kubectl apply -f deploy/operator.yaml
 ```
 
-`deploy/operator.yaml`은 `-A`(전체 네임스페이스) 모드로 배포한다 — 어떤 네임스페이스에
+### 클러스터 배포 — ArgoCD (GitOps)
+
+이 클러스터는 배포를 **ArgoCD**로 한다(seoul/seongnam과 동일 관례). `operator/deploy/k8s`
+디렉터리 하나가 전체 스택(CRD + 오퍼레이터 + 대시보드)의 GitOps 소스이고,
+`operator/deploy/argocd/traffic-ops.yaml`의 Application이 `main`을 자동 동기화한다
+(`automated: prune + selfHeal` — git이 유일한 진실, 수동 kubectl 변경은 되돌려진다).
+
+```bash
+# ArgoCD Application 최초 등록(한 번만)
+kubectl apply -f operator/deploy/argocd/traffic-ops.yaml
+
+# 대시보드 Basic 인증 Secret은 git에 없다 — 배포자가 직접 생성(조직 정책: 자격증명 비커밋)
+kubectl -n traffic-policy-dashboard create secret generic traffic-policy-dashboard-auth \
+  --from-literal=username='<아이디>' --from-literal=password='<강력한 비밀번호>'
+```
+
+**코드 변경 배포(GitOps 흐름)** — `:latest`가 아니라 **버전 태그**를 쓴다:
+```bash
+# 1) 새 버전으로 이미지 빌드·푸시
+docker build -f Dockerfile.dashboard -t registry.local.cloud:5000/traffic-policy-dashboard:v0.1.1 .
+docker push registry.local.cloud:5000/traffic-policy-dashboard:v0.1.1
+# 2) deploy/k8s/20-dashboard.yaml(또는 10-operator.yaml)의 image 태그를 올려 커밋·push
+# 3) ArgoCD가 main을 감지해 자동 동기화 → 새 이미지로 롤아웃
+```
+
+오퍼레이터 본체는 `-A`(전체 네임스페이스) 모드로 배포된다 — 어떤 네임스페이스에
 TrafficPolicy CR이 생길지 미리 알 수 없으므로 ClusterRole이 필요하다. 쓰기 권한(Deployment
 scale, HTTPRoute weight)은 각 CR의 `spec.target`에 실제로 명시된 리소스에만 적용된다.
 이 클러스터에는 `GATEWAY_IMPLEMENTATION=cilium-hubble`로 배포되어 있다(아래 "대안 트래픽
@@ -109,9 +130,8 @@ cd operator
 ./.venv/bin/uvicorn k8s_traffic_operator.dashboard.app:app --reload
 # http://localhost:8000 (정책 현황), http://localhost:8000/flows (트래픽 흐름)
 
-# 클러스터에 배포 (이미지 빌드/푸시 후 <registry> 값 교체 필요)
-docker build -f Dockerfile.dashboard -t <registry>/traffic-policy-dashboard:latest .
-kubectl apply -f deploy/dashboard.yaml
+# 클러스터 배포는 ArgoCD가 담당한다(위 "클러스터 배포 — ArgoCD" 참조).
+# 대시보드 매니페스트는 deploy/k8s/20-dashboard.yaml, 이미지 태그를 올려 커밋하면 자동 동기화된다.
 ```
 
 특정 네임스페이스만 보고 싶으면 `WATCH_NAMESPACE` 환경변수를 지정한다(비우면 클러스터 전체).
