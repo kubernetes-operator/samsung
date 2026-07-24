@@ -131,7 +131,7 @@ _STYLE = """
   .topbar { display: flex; align-items: center; gap: 24px; padding: 12px 20px;
             border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .topbar h1 { font-size: 18px; margin: 0; }
-  .home-link { font: inherit; color: inherit; font-weight: 600; text-decoration: none; }
+  .home-link { font: inherit; color: var(--info); font-weight: 600; text-decoration: none; }
   .home-link:hover { text-decoration: underline; }
   .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
   .tab { background: none; border: 1px solid transparent; color: var(--muted);
