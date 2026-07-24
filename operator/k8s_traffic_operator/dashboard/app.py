@@ -17,45 +17,48 @@
 이 앱은 클러스터에 아무것도 쓰지 않는다. `data.fetch_policies()`/`hubble_flows.fetch_summary()`가
 유일한 접근 지점이며 조회만 수행한다.
 
-`/healthz`를 제외한 모든 경로는 HTTP Basic 인증으로 보호된다(자격증명은 env
-DASHBOARD_USERNAME/DASHBOARD_PASSWORD로 주입, 미설정 시 503 fail-closed). 아래 인증
-미들웨어 참고.
+`/healthz`·`/login`·`/logout`을 제외한 모든 경로는 **폼 로그인(세션 쿠키)** 으로 보호된다.
+자격증명은 `auth.CredentialStore`가 관리하며 기본값은 admin/password, `/settings`에서
+아이디·비밀번호를 바꿀 수 있다(자세한 건 `auth.py`). 프로그램/스크립트 접근 편의를 위해
+HTTP Basic 자격증명(저장된 값과 일치)도 함께 허용한다. 아래 인증 미들웨어 참고.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import contextvars
 import html
 import os
-import secrets
 import time
 from collections import defaultdict
 from typing import List, Optional, Tuple
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from . import data, hubble_flows
+from . import auth, data, hubble_flows
 from .data import PolicySummary
 from .hubble_flows import FlowSummary
 
 app = FastAPI(title="TrafficPolicy Dashboard", docs_url=None, redoc_url=None)
 
-# --------------------------------------------------------------------------- 인증(HTTP Basic)
-# 이 대시보드는 test2.studiobasa.com 아래로 공개 노출되므로 HTTP Basic 인증으로 보호한다.
-# 자격증명은 **코드/이미지에 절대 넣지 않고** 런타임 env(DASHBOARD_USERNAME/PASSWORD)로만
-# 주입한다(배포에서는 K8s Secret -> env). env가 비어 있으면 "설정 누락"으로 보고 모든 보호
-# 경로를 503으로 막는다(fail-closed) — 인증이 안 걸린 채 실수로 공개되는 상황을 방지.
-# /healthz만 예외(쿠버네티스 프로브가 자격증명 없이 접근해야 함).
+# --------------------------------------------------------------------------- 인증(폼 로그인 + 세션)
+# 이 대시보드는 test2.studiobasa.com 아래로 공개 노출되므로 로그인으로 보호한다.
+# 자격증명은 auth.CredentialStore가 관리한다(기본 admin/password, /settings에서 변경 가능,
+# 볼륨 파일에 저장 — 클러스터에는 여전히 아무것도 쓰지 않는다). 브라우저는 로그인 폼 →
+# 서명 세션 쿠키로 인증하고, 스크립트/API는 저장된 자격증명과 일치하는 HTTP Basic도 허용한다.
+# /healthz(프로브)·/login·/logout만 인증 없이 접근 가능하다.
 _AUTH_REALM = "TrafficPolicy Dashboard"
-_PUBLIC_PATHS = frozenset({"/healthz"})
+_PUBLIC_PATHS = frozenset({"/healthz", "/login", "/logout"})
+
+# 현재 요청의 로그인 사용자명(상단바 표시용). 미들웨어가 요청마다 세팅한다.
+_current_user_var: contextvars.ContextVar = contextvars.ContextVar("dashboard_user", default=None)
 
 
-def _auth_credentials() -> Tuple[Optional[str], Optional[str]]:
-    """설정된 (username, password)를 env에서 읽는다(요청마다 읽어 재기동 없이 반영/테스트 용이)."""
-    return os.getenv("DASHBOARD_USERNAME") or None, os.getenv("DASHBOARD_PASSWORD") or None
+def current_user() -> Optional[str]:
+    return _current_user_var.get()
 
 
 def _parse_basic(header: str) -> Optional[Tuple[str, str]]:
@@ -73,32 +76,59 @@ def _parse_basic(header: str) -> Optional[Tuple[str, str]]:
     return user, password
 
 
+def _authenticate(request: Request) -> Optional[str]:
+    """요청을 인증해 사용자명을 돌려준다: (1) 유효한 세션 쿠키, (2) 저장값과 맞는 Basic."""
+    store = auth.get_store()
+    user = store.session_user(request.cookies.get(auth.COOKIE_NAME))
+    if user:
+        return user
+    creds = _parse_basic(request.headers.get("Authorization", ""))
+    if creds and store.verify(creds[0], creds[1]):
+        return creds[0]
+    return None
+
+
 @app.middleware("http")
-async def _basic_auth(request: Request, call_next):
+async def _auth_middleware(request: Request, call_next):
     if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
-    username, password = _auth_credentials()
-    if not username or not password:
-        # 자격증명 미설정 = 보호 불가 => 열어두지 않고 막는다(fail-closed).
-        return PlainTextResponse(
-            "Dashboard authentication is not configured (DASHBOARD_USERNAME/PASSWORD).",
-            status_code=503,
-        )
+    user = _authenticate(request)
+    if user is None:
+        if request.url.path.startswith("/api"):
+            return Response(
+                status_code=401,
+                headers={"WWW-Authenticate": f'Basic realm="{_AUTH_REALM}"'},
+            )
+        # 브라우저는 로그인 폼으로 보낸다(원래 가려던 경로를 next로 보존).
+        prefix = _url_prefix()
+        nxt = prefix + request.url.path
+        if request.url.query:
+            nxt += "?" + request.url.query
+        return RedirectResponse(f"{prefix}/login?{urlencode({'next': nxt})}", status_code=302)
 
-    unauthorized = Response(
-        status_code=401,
-        headers={"WWW-Authenticate": f'Basic realm="{_AUTH_REALM}"'},
+    token = _current_user_var.set(user)
+    try:
+        return await call_next(request)
+    finally:
+        _current_user_var.reset(token)
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        auth.COOKIE_NAME, token, max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True, samesite="lax",
+        secure=(request.url.scheme == "https"),
+        path=_url_prefix() or "/",
     )
-    creds = _parse_basic(request.headers.get("Authorization", ""))
-    if creds is None:
-        return unauthorized
-    # 사용자명/비밀번호 모두 상수 시간 비교(타이밍 공격 방지). 단축 평가로 새지 않도록 둘 다 계산.
-    user_ok = secrets.compare_digest(creds[0], username)
-    pass_ok = secrets.compare_digest(creds[1], password)
-    if not (user_ok and pass_ok):
-        return unauthorized
-    return await call_next(request)
+
+
+def _safe_next(next_url: Optional[str]) -> str:
+    """오픈 리다이렉트 방지: 같은 사이트 상대경로(단일 '/' 시작)만 허용, 그 외엔 홈."""
+    home = f"{_url_prefix()}/" or "/"
+    if not next_url or not next_url.startswith("/") or next_url.startswith("//"):
+        return home
+    return next_url
 
 _SEVERITY_COLOR = {"none": "#4b5563", "warning": "#b45309", "critical": "#b91c1c"}
 _PHASE_COLOR = {
@@ -167,6 +197,28 @@ _STYLE = """
   @media (prefers-reduced-motion: reduce) {
     .flow-edge { animation: none; stroke-dasharray: none; }
   }
+  /* 우측 로그인 상태 박스(사용자명·설정·로그아웃)와 로그인/설정 폼. */
+  .userbox { margin-left: auto; display: flex; align-items: center; gap: 10px;
+             font-size: 13px; color: var(--muted); }
+  .userbox a { text-decoration: none; }
+  .userbox a:hover { text-decoration: underline; }
+  .linkbtn { background: none; border: none; color: var(--info); cursor: pointer;
+             font: inherit; padding: 0; }
+  .linkbtn:hover { text-decoration: underline; }
+  .auth-card { max-width: 380px; margin: 8vh auto 0; border: 1px solid var(--border);
+               background: var(--card-bg); border-radius: 12px; padding: 24px; }
+  .auth-card h2 { margin: 0 0 4px; font-size: 18px; }
+  .auth-card .muted { margin-bottom: 16px; }
+  .field { margin-bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 13px; color: var(--muted); }
+  .field input { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+                 background: var(--bg); color: var(--fg); font-size: 14px; }
+  .btn { background: var(--info); color: #fff; border: none; border-radius: 6px;
+         padding: 9px 14px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .btn:hover { opacity: .9; }
+  .form-msg { font-size: 13px; margin-bottom: 12px; }
+  .form-msg.err { color: var(--critical); }
+  .form-msg.ok { color: #15803d; }
 """
 
 _PAGE_TEMPLATE = """<!doctype html>
@@ -180,11 +232,12 @@ _PAGE_TEMPLATE = """<!doctype html>
 </head>
 <body>
 <header class="topbar">
-  <h1><a href="{prefix}/" class="home-link">TrafficPolicy 대시보드</a></h1>
+  <h1><a href="{prefix}/" class="home-link">TrafficPolicy</a></h1>
   <nav class="tabs">
     <a href="{prefix}/" class="tab {nav_flows}">트래픽 흐름</a>
     <a href="{prefix}/policies" class="tab {nav_policies}">정책 현황</a>
   </nav>
+  {userbox}
 </header>
 <main>
   <h2 class="page-title">{heading}</h2>
@@ -193,6 +246,22 @@ _PAGE_TEMPLATE = """<!doctype html>
 </main>
 </body>
 </html>"""
+
+
+def _userbox_html() -> str:
+    """상단바 우측: 로그인 사용자명 + 설정/로그아웃. 로그인 사용자를 모르면(=Basic 접근 등) 숨김."""
+    user = current_user()
+    if not user:
+        return ""
+    prefix = _url_prefix()
+    return (
+        '<div class="userbox">'
+        f"👤 {html.escape(user)} · "
+        f'<a href="{prefix}/settings">설정</a> · '
+        f'<form method="post" action="{prefix}/logout" style="display:inline">'
+        '<button type="submit" class="linkbtn">로그아웃</button></form>'
+        "</div>"
+    )
 
 
 def _url_prefix() -> str:
@@ -236,7 +305,7 @@ def _clean_param(value: Optional[str], max_len: int = 512) -> Optional[str]:
 def _page(*, active: str, title: str, heading: str, meta: str, table: str) -> str:
     return _PAGE_TEMPLATE.format(
         title=title, style=_STYLE, heading=heading, meta=meta, table=table,
-        prefix=_url_prefix(),
+        prefix=_url_prefix(), userbox=_userbox_html(),
         nav_policies="active" if active == "policies" else "",
         nav_flows="active" if active == "flows" else "",
     )
@@ -781,3 +850,165 @@ def api_flows(scope: str = "app", namespace: Optional[str] = None, focus: Option
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- 로그인/설정 화면
+# 자동 새로고침(meta refresh)이 없는 별도 셸 — 폼 입력 중 새로고침으로 값이 날아가지 않게 한다.
+_AUTH_PAGE_TEMPLATE = """<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>{style}</style>
+</head>
+<body>
+<header class="topbar">
+  <h1><a href="{prefix}/" class="home-link">TrafficPolicy</a></h1>
+  {nav}
+  {userbox}
+</header>
+<main>{body}</main>
+</body>
+</html>"""
+
+
+def _auth_shell(*, title: str, body: str, with_nav: bool) -> str:
+    prefix = _url_prefix()
+    nav = (
+        '<nav class="tabs">'
+        f'<a href="{prefix}/" class="tab">트래픽 흐름</a>'
+        f'<a href="{prefix}/policies" class="tab">정책 현황</a></nav>'
+    ) if with_nav else ""
+    return _AUTH_PAGE_TEMPLATE.format(
+        title=title, style=_STYLE, prefix=prefix, body=body,
+        nav=nav, userbox=_userbox_html(),
+    )
+
+
+def _form_msg(*, error: Optional[str] = None, message: Optional[str] = None) -> str:
+    if error:
+        return f'<div class="form-msg err">{html.escape(error)}</div>'
+    if message:
+        return f'<div class="form-msg ok">{html.escape(message)}</div>'
+    return ""
+
+
+def _login_page(*, next_url: str = "", error: Optional[str] = None) -> str:
+    prefix = _url_prefix()
+    body = f"""<div class="auth-card">
+  <h2>로그인</h2>
+  <div class="muted">TrafficPolicy 운영 대시보드</div>
+  {_form_msg(error=error)}
+  <form method="post" action="{prefix}/login">
+    <input type="hidden" name="next" value="{html.escape(next_url)}">
+    <div class="field"><label for="username">아이디</label>
+      <input id="username" name="username" autocomplete="username" autofocus></div>
+    <div class="field"><label for="password">비밀번호</label>
+      <input id="password" name="password" type="password" autocomplete="current-password"></div>
+    <button class="btn" type="submit">로그인</button>
+  </form>
+</div>"""
+    return _auth_shell(title="로그인 · TrafficPolicy", body=body, with_nav=False)
+
+
+def _settings_page(*, username: str, error: Optional[str] = None,
+                   message: Optional[str] = None) -> str:
+    prefix = _url_prefix()
+    if auth.get_store().persistent:
+        note = "변경 내용은 저장 볼륨에 반영되어 재기동에도 유지됩니다."
+    else:
+        note = ("⚠ 저장 볼륨이 없어 변경은 이 인스턴스에만 적용되며, 재기동되면 "
+                "기본값(admin)으로 되돌아갑니다.")
+    body = f"""<div class="auth-card">
+  <h2>설정 — 로그인 자격증명 변경</h2>
+  <div class="muted">현재 로그인: {html.escape(username)}</div>
+  {_form_msg(error=error, message=message)}
+  <form method="post" action="{prefix}/settings">
+    <div class="field"><label for="cur">현재 비밀번호</label>
+      <input id="cur" name="current_password" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="nu">새 아이디</label>
+      <input id="nu" name="new_username" value="{html.escape(username)}" autocomplete="username"></div>
+    <div class="field"><label for="np">새 비밀번호(변경 시에만 입력)</label>
+      <input id="np" name="new_password" type="password" autocomplete="new-password"></div>
+    <div class="field"><label for="cp">새 비밀번호 확인</label>
+      <input id="cp" name="confirm_password" type="password" autocomplete="new-password"></div>
+    <button class="btn" type="submit">변경</button>
+  </form>
+  <p class="sub" style="margin-top:12px">{html.escape(note)}</p>
+</div>"""
+    return _auth_shell(title="설정 · TrafficPolicy", body=body, with_nav=True)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form(request: Request, next: str = ""):
+    # 이미 로그인 상태면 곧장 목적지로.
+    if auth.get_store().session_user(request.cookies.get(auth.COOKIE_NAME)):
+        return RedirectResponse(_safe_next(next), status_code=302)
+    return HTMLResponse(_login_page(next_url=next))
+
+
+@app.post("/login")
+def login_submit(request: Request, username: str = Form(""),
+                 password: str = Form(""), next: str = Form("")):
+    store = auth.get_store()
+    if not store.verify(username, password):
+        return HTMLResponse(
+            _login_page(next_url=next, error="아이디 또는 비밀번호가 올바르지 않습니다."),
+            status_code=401,
+        )
+    resp = RedirectResponse(_safe_next(next), status_code=302)
+    _set_session_cookie(resp, request, store.issue_session(username))
+    return resp
+
+
+@app.post("/logout")
+def logout(request: Request):
+    resp = RedirectResponse(f"{_url_prefix()}/login", status_code=302)
+    resp.delete_cookie(auth.COOKIE_NAME, path=_url_prefix() or "/")
+    return resp
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_form():
+    # 인증은 미들웨어가 보장. current_user()가 비면(Basic 접근) 저장된 사용자명을 쓴다.
+    return HTMLResponse(_settings_page(username=current_user() or auth.get_store().username))
+
+
+@app.post("/settings")
+def settings_submit(request: Request, current_password: str = Form(""),
+                    new_username: str = Form(""), new_password: str = Form(""),
+                    confirm_password: str = Form("")):
+    store = auth.get_store()
+    user = current_user() or store.username
+    if not store.verify(user, current_password):
+        return HTMLResponse(
+            _settings_page(username=user, error="현재 비밀번호가 올바르지 않습니다."),
+            status_code=400,
+        )
+    new_username = new_username.strip()
+    if new_password or confirm_password:
+        if new_password != confirm_password:
+            return HTMLResponse(
+                _settings_page(username=user, error="새 비밀번호가 일치하지 않습니다."),
+                status_code=400,
+            )
+        if len(new_password) < auth.MIN_PASSWORD_LEN:
+            return HTMLResponse(
+                _settings_page(username=user,
+                               error=f"새 비밀번호는 최소 {auth.MIN_PASSWORD_LEN}자 이상이어야 합니다."),
+                status_code=400,
+            )
+    username_changed = bool(new_username) and new_username != user
+    if not username_changed and not new_password:
+        return HTMLResponse(
+            _settings_page(username=user, error="변경할 내용이 없습니다."),
+            status_code=400,
+        )
+    store.update_credentials(new_username=new_username or None, new_password=new_password or None)
+    final_user = new_username or user
+    # 세션 키가 회전됐으므로 현재 사용자에게 새 쿠키를 재발급(다른 기기 세션은 무효화).
+    resp = HTMLResponse(_settings_page(
+        username=final_user, message="변경되었습니다. 다른 기기의 세션은 로그아웃됩니다."))
+    _set_session_cookie(resp, request, store.issue_session(final_user))
+    return resp

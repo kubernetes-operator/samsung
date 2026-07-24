@@ -17,11 +17,12 @@ from kubernetes.client.rest import ApiException
 from k8s_traffic_operator.dashboard import app as dashboard_app
 from k8s_traffic_operator.dashboard import data
 
-# 대시보드는 /healthz를 뺀 모든 경로가 HTTP Basic 인증으로 보호된다. 대부분의 테스트는
-# 엔드포인트의 '내용'을 검증하므로, 자격증명을 env로 세팅(autouse)하고 유효한 Authorization
-# 헤더를 기본 탑재한 클라이언트(_authed_client)를 쓴다. 인증 '동작' 자체는 별도 섹션에서 검증한다.
-_TEST_USER = "test-admin"
-_TEST_PASS = "test-secret-pw"
+# 대시보드는 /healthz·/login·/logout을 뺀 모든 경로가 로그인(세션 쿠키)으로 보호되며,
+# 저장된 자격증명과 맞는 HTTP Basic도 허용한다. 대부분의 테스트는 엔드포인트의 '내용'을
+# 검증하므로, 자격증명 저장소를 임시 파일로 격리(기본 admin/password)하고 Basic 헤더를 기본
+# 탑재한 클라이언트(_authed_client)를 쓴다. 로그인/설정 '동작'은 별도 섹션에서 검증한다.
+_TEST_USER = "admin"
+_TEST_PASS = "password"
 
 
 def _basic_header(user: str, password: str) -> dict:
@@ -30,15 +31,29 @@ def _basic_header(user: str, password: str) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _dashboard_auth_env(monkeypatch):
-    """모든 테스트에서 인증이 '설정된' 상태가 되도록 env를 채운다(개별 테스트가 delenv로 덮어쓸 수 있음)."""
-    monkeypatch.setenv("DASHBOARD_USERNAME", _TEST_USER)
-    monkeypatch.setenv("DASHBOARD_PASSWORD", _TEST_PASS)
+def _dashboard_auth_env(monkeypatch, tmp_path):
+    """각 테스트를 격리: 자격증명 저장소를 임시 파일로(기본 admin/password), 캐시 초기화."""
+    monkeypatch.delenv("DASHBOARD_USERNAME", raising=False)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.setenv("DASHBOARD_CREDENTIALS_PATH", str(tmp_path / "creds.json"))
+    dashboard_app.auth.reset_store_cache()
+    yield
+    dashboard_app.auth.reset_store_cache()
 
 
 def _authed_client() -> TestClient:
     client = TestClient(dashboard_app.app)
     client.headers.update(_basic_header(_TEST_USER, _TEST_PASS))
+    return client
+
+
+def _logged_in_client(user: str = _TEST_USER, password: str = _TEST_PASS) -> TestClient:
+    """폼 로그인으로 세션 쿠키를 받은 클라이언트."""
+    client = TestClient(dashboard_app.app)
+    resp = client.post("/login", data={"username": user, "password": password},
+                       follow_redirects=False)
+    assert resp.status_code == 302
+    assert dashboard_app.auth.COOKIE_NAME in client.cookies
     return client
 
 
@@ -294,7 +309,7 @@ def test_menu_bar_present_on_both_pages(monkeypatch):
 
 
 def test_brand_title_is_blue_and_bold(monkeypatch):
-    """상단 'TrafficPolicy 대시보드' 브랜드 제목은 앱 강조색(파란 --info) + 굵게여야 한다."""
+    """상단 'TrafficPolicy' 브랜드 제목은 앱 강조색(파란 --info) + 굵게여야 한다."""
     monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
                         lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
     text = _authed_client().get("/").text
@@ -626,49 +641,158 @@ def test_healthz_is_public_without_credentials():
     assert resp.status_code == 200
 
 
-def test_protected_route_requires_auth_returns_401_with_challenge(monkeypatch):
-    """자격증명 없이 보호 경로 접근 시 401 + WWW-Authenticate(Basic) 챌린지를 줘야 한다."""
-    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
-    resp = TestClient(dashboard_app.app).get("/")  # 인증 헤더 없음
+def test_unauthenticated_html_redirects_to_login():
+    """자격증명 없이 보호 HTML 경로 접근 시 로그인 폼으로 302 리다이렉트."""
+    resp = TestClient(dashboard_app.app).get("/", follow_redirects=False)
+    assert resp.status_code == 302
+    assert "/login" in resp.headers["location"]
+
+
+def test_api_route_is_also_protected():
+    """API 경로는 브라우저 리다이렉트 대신 401(스크립트 친화)."""
+    resp = TestClient(dashboard_app.app).get("/api/policies")
     assert resp.status_code == 401
     assert resp.headers.get("WWW-Authenticate", "").lower().startswith("basic")
 
 
-def test_api_route_is_also_protected(monkeypatch):
-    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
-    resp = TestClient(dashboard_app.app).get("/api/policies")
-    assert resp.status_code == 401
-
-
-def test_wrong_credentials_rejected(monkeypatch):
-    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+def test_wrong_basic_credentials_rejected():
     client = TestClient(dashboard_app.app)
     client.headers.update(_basic_header(_TEST_USER, "wrong-password"))
-    assert client.get("/").status_code == 401
+    assert client.get("/api/policies").status_code == 401
 
 
-def test_malformed_authorization_header_rejected(monkeypatch):
-    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+def test_malformed_authorization_header_rejected():
     client = TestClient(dashboard_app.app)
     client.headers.update({"Authorization": "Basic not-valid-base64!!"})
-    assert client.get("/").status_code == 401
+    assert client.get("/api/policies").status_code == 401
 
 
-def test_valid_credentials_allowed(monkeypatch):
+def test_valid_basic_credentials_allowed(monkeypatch):
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
     resp = _authed_client().get("/policies")
     assert resp.status_code == 200
 
 
-def test_unconfigured_auth_fails_closed_with_503(monkeypatch):
-    """DASHBOARD_USERNAME/PASSWORD 미설정이면 인증 불가 => 공개하지 않고 503으로 막는다."""
-    monkeypatch.delenv("DASHBOARD_USERNAME", raising=False)
-    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+def test_default_credentials_are_admin_password(monkeypatch):
+    """저장소가 비어 있으면 기본 자격증명은 admin/password여야 한다."""
     monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
-    # 자격증명을 보내더라도 서버가 설정 안 됐으면 503(열리면 안 됨).
     client = TestClient(dashboard_app.app)
-    client.headers.update(_basic_header(_TEST_USER, _TEST_PASS))
-    resp = client.get("/")
-    assert resp.status_code == 503
-    # 그래도 프로브는 살아 있어야 한다.
+    client.headers.update(_basic_header("admin", "password"))
+    assert client.get("/policies").status_code == 200
+
+
+def test_healthz_is_public():
     assert TestClient(dashboard_app.app).get("/healthz").status_code == 200
+
+
+# --- 폼 로그인 / 로그아웃 --------------------------------------------------
+def test_login_page_renders():
+    resp = TestClient(dashboard_app.app).get("/login")
+    assert resp.status_code == 200
+    assert "로그인" in resp.text and 'name="password"' in resp.text
+
+
+def test_login_success_sets_session_and_allows_access(monkeypatch):
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    client = _logged_in_client()
+    assert client.get("/").status_code == 200
+
+
+def test_login_failure_shows_error():
+    resp = TestClient(dashboard_app.app).post(
+        "/login", data={"username": "admin", "password": "nope"})
+    assert resp.status_code == 401
+    assert "올바르지 않습니다" in resp.text
+
+
+def test_logout_clears_session(monkeypatch):
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    client = _logged_in_client()
+    assert client.get("/").status_code == 200
+    client.post("/logout", follow_redirects=False)
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 302 and "/login" in resp.headers["location"]
+
+
+def test_topbar_shows_user_and_logout_when_logged_in(monkeypatch):
+    """세션 로그인 시 상단바에 사용자명 + 로그아웃이 보여야 한다(contextvar 전파 확인)."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    text = _logged_in_client().get("/").text
+    assert "로그아웃" in text and "admin" in text
+
+
+def test_brand_title_has_no_daeshboard_word(monkeypatch):
+    """메인 상단 브랜드는 '대시보드' 없이 'TrafficPolicy'만 표기한다."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    text = _logged_in_client().get("/").text
+    brand = text.split('class="home-link">')[1].split("</a>")[0]
+    assert brand == "TrafficPolicy"
+
+
+# --- 설정(자격증명 변경) ---------------------------------------------------
+def test_settings_requires_auth():
+    resp = TestClient(dashboard_app.app).get("/settings", follow_redirects=False)
+    assert resp.status_code == 302 and "/login" in resp.headers["location"]
+
+
+def test_change_password_updates_credentials(monkeypatch):
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    client = _logged_in_client()
+    resp = client.post("/settings", data={
+        "current_password": "password", "new_username": "admin",
+        "new_password": "newsecret", "confirm_password": "newsecret"})
+    assert resp.status_code == 200 and "변경되었습니다" in resp.text
+    # 새 비밀번호는 통과, 옛 비밀번호는 거부.
+    ok = TestClient(dashboard_app.app)
+    ok.headers.update(_basic_header("admin", "newsecret"))
+    assert ok.get("/policies").status_code == 200
+    old = TestClient(dashboard_app.app)
+    old.headers.update(_basic_header("admin", "password"))
+    assert old.get("/api/policies").status_code == 401
+
+
+def test_change_username_and_login_with_new_name(monkeypatch):
+    monkeypatch.setattr(dashboard_app.data, "fetch_policies", lambda: [])
+    client = _logged_in_client()
+    resp = client.post("/settings", data={
+        "current_password": "password", "new_username": "operator",
+        "new_password": "", "confirm_password": ""})
+    assert resp.status_code == 200
+    assert dashboard_app.auth.get_store().username == "operator"
+
+
+def test_change_password_wrong_current_rejected():
+    client = _logged_in_client()
+    resp = client.post("/settings", data={
+        "current_password": "WRONG", "new_username": "admin",
+        "new_password": "newsecret", "confirm_password": "newsecret"})
+    assert resp.status_code == 400 and "현재 비밀번호" in resp.text
+
+
+def test_change_password_mismatch_rejected():
+    client = _logged_in_client()
+    resp = client.post("/settings", data={
+        "current_password": "password", "new_username": "admin",
+        "new_password": "aaaa", "confirm_password": "bbbb"})
+    assert resp.status_code == 400 and "일치하지 않" in resp.text
+
+
+def test_password_change_rotates_other_sessions(monkeypatch):
+    """비밀번호 변경 시 다른 기기의 기존 세션은 무효화되어야 한다(세션 키 회전)."""
+    monkeypatch.setattr(dashboard_app.hubble_flows, "fetch_summary",
+                        lambda **kw: FlowSummary(total=0, shown=0, scope="app"))
+    changer = _logged_in_client()
+    other = _logged_in_client()          # 같은 자격증명으로 로그인한 다른 세션
+    assert other.get("/", follow_redirects=False).status_code == 200
+    changer.post("/settings", data={
+        "current_password": "password", "new_username": "admin",
+        "new_password": "newsecret", "confirm_password": "newsecret"})
+    # 기존 세션(other)의 쿠키는 이제 무효 → 로그인으로 리다이렉트.
+    resp = other.get("/", follow_redirects=False)
+    assert resp.status_code == 302 and "/login" in resp.headers["location"]

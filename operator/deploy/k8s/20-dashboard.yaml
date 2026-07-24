@@ -63,11 +63,17 @@ spec:
         app: traffic-policy-dashboard
     spec:
       serviceAccountName: traffic-policy-dashboard
+      # 이미지가 uid 1001로 실행되므로, 마운트한 자격증명 볼륨을 이 그룹이 쓸 수 있게 한다.
+      securityContext:
+        fsGroup: 1001
       containers:
         - name: dashboard
-          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.2
+          image: registry.local.cloud:5000/traffic-policy-dashboard:v0.1.3
           ports:
             - containerPort: 8080
+          volumeMounts:
+            - name: credentials
+              mountPath: /data
           env:
             - name: WATCH_NAMESPACE
               value: ""  # 비우면 클러스터 전체. 특정 네임스페이스만 보려면 채우고 위 RBAC도 좁힐 것.
@@ -78,21 +84,27 @@ spec:
             # 프리픽스를 붙여야 브라우저의 페이지 내 이동(nav/토글)이 프리픽스 밖으로 새지 않는다.
             - name: DASHBOARD_URL_PREFIX
               value: "/traffic-dashboard"
-            # HTTP Basic 인증 자격증명. 값은 매니페스트/이미지에 넣지 않고 Secret에서 주입한다.
-            # 이 Secret은 저장소에 커밋하지 않으며, 배포 담당자가 직접 만든다(예):
-            #   kubectl -n traffic-policy-dashboard create secret generic traffic-policy-dashboard-auth \
-            #     --from-literal=username='<원하는 아이디>' --from-literal=password='<강력한 비밀번호>'
-            # 이 두 env가 비면 대시보드는 모든 경로를 503으로 막는다(fail-closed) — /healthz만 예외.
+            # 로그인 자격증명 저장 파일 경로(아래 PVC 마운트). 여기 파일이 없으면 기본
+            # admin/password로 시작하고, /settings에서 바꾸면 이 파일에 저장돼 재기동에도 유지된다.
+            # 대시보드는 이 볼륨에만 쓰고 클러스터 API에는 여전히 아무것도 쓰지 않는다.
+            - name: DASHBOARD_CREDENTIALS_PATH
+              value: /data/credentials.json
+            # (선택) 최초 부트스트랩용 자격증명. Secret이 있으면 저장 파일이 처음 만들어질 때
+            # 그 값으로 시드한다(없으면 admin/password). Secret은 커밋하지 않으며 없어도 기동된다
+            # (optional: true). 예: kubectl -n traffic-policy-dashboard create secret generic \
+            #   traffic-policy-dashboard-auth --from-literal=username=admin --from-literal=password='...'
             - name: DASHBOARD_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: traffic-policy-dashboard-auth
                   key: username
+                  optional: true
             - name: DASHBOARD_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: traffic-policy-dashboard-auth
                   key: password
+                  optional: true
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
@@ -105,6 +117,24 @@ spec:
             # 겹치는 순간을 위해 상한에 여유를 둔다(128Mi는 정상 사용에서도 빠듯해 OOM 관측됨).
             requests: { cpu: "10m", memory: "96Mi" }
             limits: { cpu: "300m", memory: "256Mi" }
+      volumes:
+        - name: credentials
+          persistentVolumeClaim:
+            claimName: traffic-policy-dashboard-credentials
+---
+# 로그인 자격증명(username + 비밀번호 해시 + 세션 키)을 담는 파일을 보존한다. 이게 있어야
+# /settings에서 바꾼 비밀번호가 파드 재기동/재배포에도 유지된다. 없으면(또는 쓰기 불가면)
+# 대시보드는 메모리로만 동작해 재기동 시 기본 admin/password로 되돌아간다.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traffic-policy-dashboard-credentials
+  namespace: traffic-policy-dashboard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi
 ---
 apiVersion: v1
 kind: Service
@@ -122,8 +152,8 @@ spec:
 # 접근 가능하게 한다. test1/test2.studiobasa.com은 와일드카드가 아니라 개별로 등록된
 # DNS 레코드라서, 새 서브도메인을 만드는 대신 이미 다른 앱들(gitea/demo-app/monitoring 등)이
 # 쓰는 것과 같은 방식으로 test2.studiobasa.com 아래 경로(/traffic-dashboard)를 붙인다.
-# 공개 호스트로 노출되므로 앱 레벨 HTTP Basic 인증으로 보호한다(위 Deployment의
-# DASHBOARD_USERNAME/PASSWORD, traffic-policy-dashboard-auth Secret). 더 강한 통제가
+# 공개 호스트로 노출되므로 앱 레벨 로그인(폼+세션 쿠키, 기본 admin/password, /settings에서
+# 변경)으로 보호한다. 스크립트용 HTTP Basic도 같은 자격증명으로 허용한다. 더 강한 통제가
 # 필요하면 게이트웨이 레벨 IP 제한/OIDC 프록시를 추가로 검토.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

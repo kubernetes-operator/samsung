@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir fastapi uvicorn kubernetes
+# python-multipart: 로그인/설정 폼(application/x-www-form-urlencoded) 파싱에 필요.
+RUN pip install --no-cache-dir fastapi uvicorn kubernetes python-multipart
 
 COPY k8s_traffic_operator/schemas.py k8s_traffic_operator/schemas.py
 COPY k8s_traffic_operator/__init__.py k8s_traffic_operator/__init__.py
