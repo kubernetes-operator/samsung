@@ -94,5 +94,6 @@ spec:
             - name: HUBBLE_RELAY_ADDR
               value: "hubble-relay.kube-system.svc.cluster.local:80"
           resources:
-            requests: { cpu: "20m", memory: "64Mi" }
+            # memory p95 ≈ 111Mi (canggu 관측, 2026-11-17) → 64Mi 는 부족해 상시 초과. 여유 포함 128Mi.
+            requests: { cpu: "20m", memory: "128Mi" }
             limits: { cpu: "200m", memory: "256Mi" }
