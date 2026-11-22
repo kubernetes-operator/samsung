@@ -198,7 +198,8 @@ def get_store() -> CredentialStore:
     with _stores_lock:
         store = _stores.get(path)
         if store is None:
-            store = CredentialStore(path)
+            from .accounts import AccountStore
+            store = AccountStore(path)
             _stores[path] = store
         return store
 
